@@ -177,6 +177,29 @@ async fn main() -> io::Result<()> {
     let session_registry = Arc::new(SessionRegistry::new());
     let address_book = Arc::new(WsAddressBook::new());
 
+    // Response cache for read-heavy endpoints — Issue #910
+    let response_cache = crate::middleware::cache::ResponseCache::new(redis_conn.clone());
+
+    // Real-time leaderboard deltas — Issue #900
+    let leaderboard_broadcaster = Arc::new(
+        crate::realtime::leaderboard_broadcaster::LeaderboardBroadcaster::new(event_bus.clone()),
+    );
+
+    // The per-player throttle holds back the tail of a burst until something
+    // else arrives to shake it loose. This timer is that something: it costs
+    // one lock acquisition per second per category and guarantees the last
+    // change a player made is delivered within a second of happening.
+    {
+        let broadcaster = leaderboard_broadcaster.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                ticker.tick().await;
+                broadcaster.flush_all().await;
+            }
+        });
+    }
+
     // Initialize Auth Services for Realtime
     let jwt_config = crate::auth::jwt_service::JwtConfig::from_config(
         config.auth.jwt_secret.clone(),
@@ -216,6 +239,8 @@ async fn main() -> io::Result<()> {
             .app_data(web::Data::new(redis_conn.clone()))
             .app_data(web::Data::new(auth_service.clone()))
             .app_data(web::Data::new(event_bus.clone()))
+            .app_data(web::Data::new(response_cache.clone()))
+            .app_data(web::Data::new(leaderboard_broadcaster.clone()))
             .app_data(web::Data::new(session_registry.clone()))
             .app_data(web::Data::new(address_book.clone()))
             .app_data(web::Data::new(jwt_service.clone()))
@@ -377,6 +402,16 @@ async fn main() -> io::Result<()> {
                             .route("/config", web::get().to(crate::http::idempotency_examples::get_idempotency_config))
                     ),
             )
+            // Registered at the app level, not inside the `/api` scope above:
+            // both modules declare their own `/api/...` scope, so nesting them
+            // would produce `/api/api/...`.
+            //
+            // Player suspensions and appeals — Issue #906
+            .configure(crate::http::suspension_handler::configure)
+            // Email notification preferences and unsubscribe — Issue #905
+            .configure(crate::http::email_handler::configure)
+            // Cache hit/miss metrics — Issue #910
+            .configure(crate::http::cache_handler::configure)
             .configure(crate::realtime::user_ws::configure_ws_route)
     })
     .bind((config.server.host.clone(), config.server.port))?

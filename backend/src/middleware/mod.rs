@@ -1,6 +1,7 @@
 // Middleware module for ArenaX
 
 pub mod anti_bot;
+pub mod cache;
 pub mod authorization;
 pub mod circuit_breaker;
 pub mod csrf;
@@ -13,6 +14,10 @@ pub mod security_headers;
 pub mod tracing_middleware;
 
 pub use anti_bot::AntiBotMiddleware;
+pub use cache::{
+    keys as cache_keys, policies as cache_policies, CacheHit, CacheMetricsSnapshot, CachePolicy,
+    CacheStatus, ResponseCache,
+};
 pub use authorization::{
     AccessControlEngine, AuditDecision, AuditLogEntry, AuthorizationMiddleware,
     Permission, PermissionAuditLogger, RoleHierarchy, RoleTemplate, RoleTemplateRegistry,
