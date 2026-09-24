@@ -3,6 +3,7 @@
 import { useEffect } from 'react';
 import { defaultWebVitalsReporter } from '@/lib/webVitalsReporter';
 import type { WebVitalMetric } from '@/lib/webVitalsReporter';
+import { CONSENT_CHANGE_EVENT, hasConsentedTo } from '@/lib/consentPreferences';
 
 /**
  * Client component that wires the web vitals reporter into the
@@ -29,6 +30,12 @@ export function WebVitalsInit() {
           'NEXT_PUBLIC_ANALYTICS_ENDPOINT is not set.'
         );
       }
+      return;
+    }
+
+    // Web Vitals are non-essential telemetry — require "performance"
+    // consent before loading web-vitals or reporting anything (#1093).
+    if (!hasConsentedTo('performance')) {
       return;
     }
 
