@@ -33,7 +33,7 @@ opentelemetry-http = "0.32"
 sha2 = "0.10"
 dotenvy = "0.15"
 actix-cors = "0.6"
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
 base64 = "0.22"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 rand = "0.8"
@@ -49,6 +49,9 @@ zeroize = { version = "1.8", features = ["derive"] }
 
 # Security: pin patched versions of transitive deps
 quinn-proto = "0.11.14"
+sentry = { version = "0.49.3", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls", "debug-images"] }
+sentry-actix = "0.49.3"
+sentry-tracing = "0.49.3"
 
 [dev-dependencies]
 tokio-test = "0.4"
