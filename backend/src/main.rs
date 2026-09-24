@@ -30,6 +30,7 @@ use crate::middleware::security::{SecurityConfig, SecurityMiddleware};
 use crate::middleware::security_headers::security_headers;
 use crate::middleware::tracing_middleware::RequestTracing;
 use crate::service::batch_service::BatchService;
+use crate::service::evidence_storage::{EvidenceStore, S3EvidenceStore};
 use crate::service::match_authority_service::MatchAuthorityService;
 use crate::service::ReaperService;
 use crate::realtime::event_bus::EventBus;
@@ -210,6 +211,9 @@ async fn main() -> io::Result<()> {
     // Snapshot the rate limit config so it can be moved into the HttpServer closure.
     let rate_limit_config = config.rate_limit.clone();
 
+    // Tamper-evident dispute evidence storage (#1081, #1076).
+    let evidence_store: Arc<dyn EvidenceStore> = Arc::new(S3EvidenceStore::new(&config.storage));
+
     let server = HttpServer::new(move || {
         App::new()
             .app_data(web::Data::new(db_pool.clone()))
@@ -228,6 +232,10 @@ async fn main() -> io::Result<()> {
             .app_data(web::Data::new(batch_service.clone()))
             .app_data(web::Data::new(match_authority_service.clone()))
             .app_data(web::Data::new(protocol_signer_secret.clone()))
+            .app_data(web::Data::new(evidence_store.clone()))
+            // 5 MB cap on dispute evidence uploads (#1076); enforced before
+            // the handler runs so an oversized body never reaches our code.
+            .app_data(web::PayloadConfig::default().limit(5 * 1024 * 1024))
             .wrap(IdempotencyMiddleware::new(redis_conn.clone(), idempotency_policy.clone()))
             .wrap(RateLimitMiddleware::new(redis_conn.clone(), rate_limit_config.clone()))
             .wrap(SecurityMiddleware::new(redis_conn.clone(), SecurityConfig::default()))
@@ -334,6 +342,10 @@ async fn main() -> io::Result<()> {
                     .configure(crate::http::tournament_handler::configure_routes)
                     // Match authority endpoints — on-chain match FSM
                     .configure(crate::http::match_authority_handler::configure_routes)
+                    // Dispute evidence upload + tamper-evident hash — #1081, #1076
+                    .configure(crate::http::dispute_evidence_handler::configure_routes)
+                    // Season close (ELO decay + leaderboard snapshot) — #1075
+                    .configure(crate::http::leaderboard_handler::configure_routes)
                     // Gas endpoints
                     .service(
                         web::scope("/gas")

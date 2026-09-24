@@ -6,6 +6,7 @@ pub mod health;
 pub mod idempotency;
 pub mod idempotency_examples;
 pub mod achievement_handler;
+pub mod dispute_evidence_handler;
 pub mod docs_handler;
 pub mod ip_list_handler;
 pub mod leaderboard_handler;
