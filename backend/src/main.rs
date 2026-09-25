@@ -28,6 +28,7 @@ use crate::middleware::metrics_middleware::RequestMetrics;
 use crate::middleware::rate_limit::RateLimitMiddleware;
 use crate::middleware::security::{SecurityConfig, SecurityMiddleware};
 use crate::middleware::security_headers::security_headers;
+use crate::middleware::tenant_context::TenantContextMiddleware;
 use crate::middleware::tracing_middleware::RequestTracing;
 use crate::service::batch_service::BatchService;
 use crate::service::match_authority_service::MatchAuthorityService;
@@ -172,6 +173,13 @@ async fn main() -> io::Result<()> {
     // Initialize BatchService — Issue #952
     let batch_service = Arc::new(BatchService::new(db_pool.clone()));
 
+    // Fan-out notification delivery (in-app/push/email) — Issue #1107
+    let notification_service = Arc::new(crate::service::notification_service::NotificationService::new(
+        db_pool.clone(),
+        config.notifications.sendgrid_api_key.clone(),
+        config.notifications.sendgrid_from_email.clone(),
+    ));
+
     // Initialize real-time infrastructure
     let event_bus = EventBus::new(redis_conn.clone());
     let session_registry = Arc::new(SessionRegistry::new());
@@ -226,8 +234,10 @@ async fn main() -> io::Result<()> {
             .app_data(web::Data::new(tournament_service.clone()))
             // Match authority service + protocol signer for on-chain match lifecycle
             .app_data(web::Data::new(batch_service.clone()))
+            .app_data(web::Data::new(notification_service.clone()))
             .app_data(web::Data::new(match_authority_service.clone()))
             .app_data(web::Data::new(protocol_signer_secret.clone()))
+            .wrap(TenantContextMiddleware)
             .wrap(IdempotencyMiddleware::new(redis_conn.clone(), idempotency_policy.clone()))
             .wrap(RateLimitMiddleware::new(redis_conn.clone(), rate_limit_config.clone()))
             .wrap(SecurityMiddleware::new(redis_conn.clone(), SecurityConfig::default()))

@@ -45,6 +45,8 @@ once_cell = "1.19"
 prometheus = { version = "0.13", features = ["process"] }
 aes-gcm = { version = "0.10", features = ["zeroize"] }
 zeroize = { version = "1.8", features = ["derive"] }
+# Object-safe async trait for pluggable notification channel senders (#1107)
+async-trait = "0.1"
 
 
 # Security: pin patched versions of transitive deps
