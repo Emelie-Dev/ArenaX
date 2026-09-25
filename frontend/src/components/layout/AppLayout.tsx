@@ -13,6 +13,7 @@ import { PageTransition } from "@/components/layout/PageTransition";
 import { KeyboardShortcutsHelp } from "@/components/ui/KeyboardShortcutsHelp";
 import { useKeyboardShortcuts } from "@/hooks/useKeyboardShortcuts";
 import { SessionTimeoutProvider } from "@/contexts/SessionTimeoutContext";
+import { NotificationBadgeEffect } from "@/hooks/useNotificationBadge";
 // #759: next-intl's Link, not next/link. It prefixes the active locale
 // automatically, so "/about" resolves to "/en/about" and following a footer
 // link never resets the user's language.
@@ -56,6 +57,7 @@ export function AppLayout({ children }: AppLayoutProps) {
 
   return (
     <SessionTimeoutProvider>
+      <NotificationBadgeEffect />
       <div className="min-h-screen bg-background font-sans antialiased flex flex-col">
         <OfflineBanner />
         <SkipLink targetId="main-content" />

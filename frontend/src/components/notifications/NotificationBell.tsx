@@ -5,6 +5,7 @@ import Link from "next/link";
 import { Bell, CheckCheck, Trash2, Loader2, RefreshCw, Settings, BellOff } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useNotifications } from "@/contexts/NotificationContext";
+import { clearAppBadge } from "@/hooks/useNotificationBadge";
 import { Button } from "@/components/ui/Button";
 import { EmptyState } from "@/components/common/EmptyState";
 import { PersistentNotification } from "@/types/notification";
@@ -133,7 +134,15 @@ export function NotificationBell({ className, onClose }: NotificationBellProps) 
         variant="ghost"
         size="sm"
         className="relative h-9 w-9 p-0"
-        onClick={() => setIsOpen((o) => !o)}
+        onClick={() => {
+          setIsOpen((o) => {
+            const next = !o;
+            // Viewing notifications clears the PWA app badge immediately (#1095) —
+            // the tab title badge follows separately once unreadCount drops.
+            if (next) clearAppBadge();
+            return next;
+          });
+        }}
         aria-label={`Notifications${unreadCount > 0 ? `, ${unreadCount} unread` : ""}`}
         aria-expanded={isOpen}
         aria-haspopup="true"
