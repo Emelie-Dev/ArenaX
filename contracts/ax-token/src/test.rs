@@ -712,3 +712,231 @@ fn test_adjust_cap_via_governance() {
     client.mint(&user1, &2000i128);
     assert_eq!(client.total_supply(), 3000);
 }
+
+// ============================================================================
+// SNAPSHOT VOTING (#919)
+// ============================================================================
+//
+// NOTE: `FlashLoanGuard` (src/flash_loan_protection.rs) treats ledger
+// sequence 0 as "no prior operation" and the *first* protected call (burn,
+// transfer, or vote_on_proposal) for any address, in any fresh test `Env`,
+// also runs at sequence 0 — so it collides with that default and is always
+// rejected as a false "flash loan". This is a pre-existing bug, unrelated to
+// snapshot voting; every test below advances the ledger sequence to a
+// non-zero number before the first such call to avoid tripping it.
+
+#[test]
+fn test_snapshot_power_fixed_at_proposal_creation() {
+    // Voting power used for a proposal must reflect the balance an address
+    // held when the proposal was created, not whatever it holds by the time
+    // it actually votes — otherwise a voter could inflate their power after
+    // the fact by acquiring more tokens.
+    let (env, admin, user1, _) = create_test_env();
+    let contract_id = initialize_contract(&env, &admin);
+    let client = AxTokenClient::new(&env, &contract_id);
+
+    env.mock_all_auths();
+    env.ledger().set_sequence_number(100);
+    env.ledger().set_timestamp(1_000);
+    client.mint(&user1, &1000i128);
+
+    env.ledger().set_sequence_number(101);
+    let proposal_desc = String::from_str(&env, "Snapshot test");
+    let proposal_id = client.create_proposal(&user1, &proposal_desc, &3600u64);
+    let proposal = client.get_proposal(&proposal_id).unwrap();
+    assert_eq!(proposal.snapshot_ledger, 101);
+
+    // Balance grows well after the snapshot was taken.
+    env.ledger().set_sequence_number(102);
+    client.mint(&user1, &5000i128);
+    assert_eq!(client.balance(&user1), 6000);
+
+    env.ledger().set_sequence_number(103);
+    client.vote_on_proposal(&user1, &proposal_id, &true);
+
+    let proposal = client.get_proposal(&proposal_id).unwrap();
+    assert_eq!(
+        proposal.votes_for, 1000,
+        "vote should be weighted by the snapshot balance (1000), not the current one (6000)"
+    );
+}
+
+#[test]
+fn test_voting_power_at_reflects_delegation_snapshot() {
+    // A delegation made after a given ledger must not retroactively change
+    // the voting power recorded at that ledger, and must be reflected once
+    // it has actually happened.
+    let (env, admin, user1, user2) = create_test_env();
+    let contract_id = initialize_contract(&env, &admin);
+    let client = AxTokenClient::new(&env, &contract_id);
+
+    env.mock_all_auths();
+    env.ledger().set_sequence_number(100);
+    client.mint(&user1, &1000i128);
+    client.mint(&user2, &500i128);
+    let ledger_before_delegation = env.ledger().sequence();
+
+    env.ledger().set_sequence_number(101);
+    client.delegate(&user2, &user1);
+    let ledger_after_delegation = env.ledger().sequence();
+
+    // Before the delegation: each holder's own balance.
+    assert_eq!(
+        client.get_voting_power_at(&user1, &ledger_before_delegation),
+        1000
+    );
+    assert_eq!(
+        client.get_voting_power_at(&user2, &ledger_before_delegation),
+        500
+    );
+
+    // After the delegation: user1 also carries user2's power; user2 has none.
+    assert_eq!(
+        client.get_voting_power_at(&user1, &ledger_after_delegation),
+        1500
+    );
+    assert_eq!(
+        client.get_voting_power_at(&user2, &ledger_after_delegation),
+        0
+    );
+
+    // A proposal snapshotted after the delegation counts the combined power.
+    env.ledger().set_sequence_number(102);
+    env.ledger().set_timestamp(1_000);
+    let proposal_desc = String::from_str(&env, "Delegated vote");
+    let proposal_id = client.create_proposal(&user1, &proposal_desc, &3600u64);
+
+    env.ledger().set_sequence_number(103);
+    client.vote_on_proposal(&user1, &proposal_id, &true);
+
+    let proposal = client.get_proposal(&proposal_id).unwrap();
+    assert_eq!(proposal.votes_for, 1500);
+}
+
+#[test]
+fn test_revoke_delegation_restores_snapshot_power() {
+    let (env, admin, user1, user2) = create_test_env();
+    let contract_id = initialize_contract(&env, &admin);
+    let client = AxTokenClient::new(&env, &contract_id);
+
+    env.mock_all_auths();
+    env.ledger().set_sequence_number(100);
+    client.mint(&user1, &1000i128);
+    client.mint(&user2, &500i128);
+
+    env.ledger().set_sequence_number(101);
+    client.delegate(&user2, &user1);
+    assert_eq!(client.get_voting_power(&user1), 1500);
+    assert_eq!(client.get_voting_power(&user2), 0);
+
+    env.ledger().set_sequence_number(102);
+    client.revoke_delegation(&user2);
+    assert_eq!(client.get_voting_power(&user1), 1000);
+    assert_eq!(client.get_voting_power(&user2), 500);
+
+    // The snapshot at the ledger where the delegation was still active is
+    // unaffected by the later revocation.
+    assert_eq!(client.get_voting_power_at(&user1, &101), 1500);
+    assert_eq!(client.get_voting_power_at(&user2, &101), 0);
+}
+
+#[test]
+fn test_block_number_reference_on_proposal() {
+    // The proposal exposes the ledger sequence ("block number") its snapshot
+    // was taken at, and it matches the actual current ledger at creation.
+    let (env, admin, user1, _) = create_test_env();
+    let contract_id = initialize_contract(&env, &admin);
+    let client = AxTokenClient::new(&env, &contract_id);
+
+    env.mock_all_auths();
+    env.ledger().set_sequence_number(250);
+    client.mint(&user1, &1000i128);
+
+    let proposal_desc = String::from_str(&env, "Block reference test");
+    let proposal_id = client.create_proposal(&user1, &proposal_desc, &3600u64);
+    let proposal = client.get_proposal(&proposal_id).unwrap();
+
+    assert_eq!(proposal.snapshot_ledger, 250);
+    assert_eq!(proposal.snapshot_ledger, env.ledger().sequence());
+}
+
+#[test]
+fn test_vote_aggregation_and_historical_records() {
+    // Vote tallies aggregate correctly on-chain, and each individual vote is
+    // retrievable afterward for historical/auditing purposes.
+    let (env, admin, user1, user2) = create_test_env();
+    let contract_id = initialize_contract(&env, &admin);
+    let client = AxTokenClient::new(&env, &contract_id);
+    let user3 = Address::generate(&env);
+
+    env.mock_all_auths();
+    env.ledger().set_sequence_number(100);
+    env.ledger().set_timestamp(1_000);
+    client.mint(&user1, &1500i128);
+    client.mint(&user2, &500i128);
+    client.mint(&user3, &300i128);
+
+    env.ledger().set_sequence_number(101);
+    let proposal_desc = String::from_str(&env, "Aggregate votes");
+    let proposal_id = client.create_proposal(&user1, &proposal_desc, &3600u64);
+
+    env.ledger().set_sequence_number(102);
+    client.vote_on_proposal(&user1, &proposal_id, &true);
+    env.ledger().set_sequence_number(103);
+    client.vote_on_proposal(&user2, &proposal_id, &false);
+    env.ledger().set_sequence_number(104);
+    client.vote_on_proposal(&user3, &proposal_id, &true);
+
+    let proposal = client.get_proposal(&proposal_id).unwrap();
+    assert_eq!(proposal.votes_for, 1800);
+    assert_eq!(proposal.votes_against, 500);
+
+    let records = client.get_vote_records(&proposal_id);
+    assert_eq!(records.len(), 3);
+
+    let r0 = records.get(0).unwrap();
+    assert_eq!(r0.voter, user1);
+    assert!(r0.support);
+    assert_eq!(r0.power, 1500);
+    assert_eq!(r0.ledger, 102);
+
+    let r1 = records.get(1).unwrap();
+    assert_eq!(r1.voter, user2);
+    assert!(!r1.support);
+    assert_eq!(r1.power, 500);
+    assert_eq!(r1.ledger, 103);
+
+    let r2 = records.get(2).unwrap();
+    assert_eq!(r2.voter, user3);
+    assert!(r2.support);
+    assert_eq!(r2.power, 300);
+    assert_eq!(r2.ledger, 104);
+}
+
+#[test]
+fn test_transfer_and_burn_update_voting_power_checkpoints() {
+    // Transfers and burns move checkpointed voting power immediately, so a
+    // snapshot taken right after either reflects the new balances.
+    let (env, admin, user1, user2) = create_test_env();
+    let contract_id = initialize_contract(&env, &admin);
+    let client = AxTokenClient::new(&env, &contract_id);
+
+    env.mock_all_auths();
+    env.ledger().set_sequence_number(100);
+    client.mint(&user1, &1000i128);
+    assert_eq!(client.get_voting_power(&user1), 1000);
+    assert_eq!(client.get_voting_power(&user2), 0);
+
+    env.ledger().set_sequence_number(101);
+    client.transfer(&user1, &user2, &400i128);
+    assert_eq!(client.get_voting_power(&user1), 600);
+    assert_eq!(client.get_voting_power(&user2), 400);
+
+    env.ledger().set_sequence_number(102);
+    client.burn(&user2, &100i128);
+    assert_eq!(client.get_voting_power(&user2), 300);
+
+    // Earlier snapshots are untouched by the later transfer/burn.
+    assert_eq!(client.get_voting_power_at(&user1, &100), 1000);
+    assert_eq!(client.get_voting_power_at(&user2, &100), 0);
+}

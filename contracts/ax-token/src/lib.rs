@@ -35,6 +35,11 @@ pub struct Proposal {
     pub votes_against: i128,
     pub end_time: u64,
     pub executed: bool,
+    /// Ledger sequence ("block number") at proposal creation. Voting power is
+    /// read as of this snapshot rather than live, so buying tokens (or
+    /// collecting a delegation) after a proposal opens can't manufacture
+    /// extra votes.
+    pub snapshot_ledger: u32,
 }
 
 #[contracttype]
@@ -59,6 +64,27 @@ pub struct DelegationRecord {
     pub delegatee: Address,
     pub timestamp: u64,
     pub revoked: bool,
+}
+
+/// One entry in an address's voting-power history: the power in effect from
+/// `ledger` onward, until the next checkpoint (if any). Checkpoints are
+/// appended in non-decreasing `ledger` order, so a snapshot lookup for a past
+/// ledger is a binary search for the last entry at or before it.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct VotingCheckpoint {
+    pub ledger: u32,
+    pub power: i128,
+}
+
+/// A single cast vote, recorded for historical/auditing purposes.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct VoteRecord {
+    pub voter: Address,
+    pub support: bool,
+    pub power: i128,
+    pub ledger: u32,
 }
 
 #[contracttype]
@@ -90,6 +116,19 @@ pub enum DataKey {
     // Flash loan protection
     LastOpSequence(Address),
     GlobalLastSequence,
+    // Emergency pause
+    PauseInfo,
+    Paused,
+    PauseTimeout,
+    // Supply cap enforcement
+    SupplyCap,
+    // Vote delegation
+    Delegate(Address),
+    Delegators(Address),
+    DelegationHistory(Address),
+    // Voting-power snapshots
+    Checkpoints(Address),
+    VoteRecords(u64),
 }
 
 #[contract]
@@ -144,6 +183,8 @@ impl AxToken {
             .instance()
             .set(&DataKey::TotalSupply, &new_supply);
 
+        Self::checkpoint_add(env, &Self::voting_power_holder(env, &to), amount);
+
         events::emit_mint(env, &to, amount);
     }
 
@@ -180,6 +221,8 @@ impl AxToken {
             let new_cap = cap.saturating_sub(amount);
             env.storage().instance().set(&DataKey::SupplyCap, &new_cap);
         }
+
+        Self::checkpoint_add(env, &Self::voting_power_holder(env, &from), -amount);
 
         events::emit_burn(env, &from, amount);
     }
@@ -219,6 +262,9 @@ impl AxToken {
         env.storage()
             .instance()
             .set(&DataKey::Balance(to.clone()), &new_to_balance);
+
+        Self::checkpoint_add(env, &Self::voting_power_holder(env, &from), -amount);
+        Self::checkpoint_add(env, &Self::voting_power_holder(env, &to), amount);
 
         events::emit_transfer(env, &from, &to, amount);
     }
@@ -714,6 +760,7 @@ impl AxToken {
             votes_against: 0,
             end_time: env.ledger().timestamp() + voting_duration,
             executed: false,
+            snapshot_ledger: env.ledger().sequence(),
         };
 
         env.storage()
@@ -757,7 +804,11 @@ impl AxToken {
             panic!("already voted");
         }
 
-        let voting_power = Self::get_voting_power(env.clone(), voter.clone());
+        // Snapshot lookup: power is read as of the proposal's creation ledger,
+        // not live, so it can't be inflated by acquiring tokens or a
+        // delegation after the proposal opened.
+        let voting_power =
+            Self::get_voting_power_at(env.clone(), voter.clone(), proposal.snapshot_ledger);
 
         if voting_power <= 0 {
             panic!("no voting power");
@@ -774,6 +825,20 @@ impl AxToken {
             .set(&DataKey::Proposal(proposal_id), &proposal);
         env.storage().instance().set(&vote_key, &true);
 
+        let records_key = DataKey::VoteRecords(proposal_id);
+        let mut records: Vec<VoteRecord> = env
+            .storage()
+            .instance()
+            .get(&records_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        records.push_back(VoteRecord {
+            voter: voter.clone(),
+            support,
+            power: voting_power,
+            ledger: env.ledger().sequence(),
+        });
+        env.storage().instance().set(&records_key, &records);
+
         env.events().publish(
             (
                 Symbol::new(&env, "ArenaXToken_v1"),
@@ -781,6 +846,15 @@ impl AxToken {
             ),
             (proposal_id, voter, support, voting_power),
         );
+    }
+
+    /// Full history of individual votes cast on `proposal_id`, in the order
+    /// they were cast.
+    pub fn get_vote_records(env: Env, proposal_id: u64) -> Vec<VoteRecord> {
+        env.storage()
+            .instance()
+            .get(&DataKey::VoteRecords(proposal_id))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     pub fn get_proposal(env: Env, proposal_id: u64) -> Option<Proposal> {
@@ -807,17 +881,24 @@ impl AxToken {
         let current_time = env.ledger().timestamp();
         let previous = Self::get_delegate(env.clone(), delegator.clone());
 
+        let power = Self::balance(&env, delegator.clone())
+            + Self::get_locked_balance(env.clone(), delegator.clone());
+
         if let Some(previous_delegatee) = previous {
             if previous_delegatee == delegatee {
                 panic!("already delegated to this address");
             }
             Self::remove_delegator(&env, &previous_delegatee, &delegator);
+            Self::checkpoint_add(&env, &previous_delegatee, -power);
+        } else {
+            Self::checkpoint_add(&env, &delegator, -power);
         }
 
         env.storage()
             .instance()
             .set(&DataKey::Delegate(delegator.clone()), &delegatee);
         Self::add_delegator(&env, &delegatee, &delegator);
+        Self::checkpoint_add(&env, &delegatee, power);
 
         let mut history = Self::get_delegation_history(env.clone(), delegator.clone());
         history.push_back(DelegationRecord {
@@ -845,10 +926,15 @@ impl AxToken {
         let delegatee =
             Self::get_delegate(env.clone(), delegator.clone()).expect("no active delegation found");
 
+        let power = Self::balance(&env, delegator.clone())
+            + Self::get_locked_balance(env.clone(), delegator.clone());
+
         Self::remove_delegator(&env, &delegatee, &delegator);
         env.storage()
             .instance()
             .remove(&DataKey::Delegate(delegator.clone()));
+        Self::checkpoint_add(&env, &delegatee, -power);
+        Self::checkpoint_add(&env, &delegator, power);
 
         let mut history = Self::get_delegation_history(env.clone(), delegator.clone());
         history.push_back(DelegationRecord {
@@ -890,28 +976,97 @@ impl AxToken {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
-    /// Effective voting power for `address`: their own balance + locked
-    /// balance (zero if they've delegated it away) plus the raw power of
-    /// every address currently delegating to them. Delegation chains are not
-    /// followed further than one hop — a delegatee's received power isn't
-    /// forwarded on if they in turn delegate elsewhere.
+    /// Current effective voting power for `address`: their own balance +
+    /// locked balance (zero if they've delegated it away) plus the raw power
+    /// of every address currently delegating to them. Backed by the same
+    /// voting-power checkpoints `get_voting_power_at` reads, so it's always
+    /// consistent with a snapshot taken "now".
     pub fn get_voting_power(env: Env, address: Address) -> i128 {
-        let has_delegated = Self::get_delegate(env.clone(), address.clone()).is_some();
-        let own_power = if has_delegated {
-            0
-        } else {
-            Self::balance(&env, address.clone())
-                + Self::get_locked_balance(env.clone(), address.clone())
-        };
+        Self::power_at(&env, &address, env.ledger().sequence())
+    }
 
-        let delegators = Self::get_delegators(env.clone(), address.clone());
-        let mut delegated_power = 0i128;
-        for delegator in delegators.iter() {
-            delegated_power += Self::balance(&env, delegator.clone())
-                + Self::get_locked_balance(env.clone(), delegator.clone());
+    /// Effective voting power for `address` as of a past ledger sequence
+    /// (the Soroban analog of a block number). Used by `vote_on_proposal` so
+    /// votes are weighted by power held at proposal-creation time rather
+    /// than whatever the caller holds right now.
+    pub fn get_voting_power_at(env: Env, address: Address, ledger_seq: u32) -> i128 {
+        Self::power_at(&env, &address, ledger_seq)
+    }
+
+    /// The address whose checkpoint currently represents `address`'s voting
+    /// power: `address` itself, unless it has delegated away, in which case
+    /// it's the delegatee.
+    fn voting_power_holder(env: &Env, address: &Address) -> Address {
+        Self::get_delegate(env.clone(), address.clone()).unwrap_or_else(|| address.clone())
+    }
+
+    /// Record a change of `delta` to `address`'s voting power as of the
+    /// current ledger, appending a new checkpoint (or updating the current
+    /// ledger's checkpoint if one was already written this ledger).
+    fn checkpoint_add(env: &Env, address: &Address, delta: i128) {
+        let key = DataKey::Checkpoints(address.clone());
+        let mut checkpoints: Vec<VotingCheckpoint> = env
+            .storage()
+            .instance()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+
+        let current_ledger = env.ledger().sequence();
+        let previous_power = checkpoints.last().map(|c| c.power).unwrap_or(0);
+        let new_power = previous_power + delta;
+
+        match checkpoints.last() {
+            Some(last) if last.ledger == current_ledger => {
+                let last_index = checkpoints.len() - 1;
+                checkpoints.set(
+                    last_index,
+                    VotingCheckpoint {
+                        ledger: current_ledger,
+                        power: new_power,
+                    },
+                );
+            }
+            _ => {
+                checkpoints.push_back(VotingCheckpoint {
+                    ledger: current_ledger,
+                    power: new_power,
+                });
+            }
         }
 
-        own_power + delegated_power
+        env.storage().instance().set(&key, &checkpoints);
+    }
+
+    /// Binary search `address`'s checkpoint history for the power in effect
+    /// at `ledger_seq` (the last checkpoint at or before it, 0 if none).
+    fn power_at(env: &Env, address: &Address, ledger_seq: u32) -> i128 {
+        let checkpoints: Vec<VotingCheckpoint> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Checkpoints(address.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+
+        if checkpoints.is_empty() {
+            return 0;
+        }
+
+        let mut low: u32 = 0;
+        let mut high: u32 = checkpoints.len();
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let checkpoint = checkpoints.get(mid).unwrap();
+            if checkpoint.ledger <= ledger_seq {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+
+        if low == 0 {
+            0
+        } else {
+            checkpoints.get(low - 1).unwrap().power
+        }
     }
 
     fn add_delegator(env: &Env, delegatee: &Address, delegator: &Address) {
