@@ -16,6 +16,8 @@ mod nft_staking;
 mod oracle;
 mod rewards;
 mod storage;
+#[cfg(test)]
+mod test;
 
 use arenax_events::virtual_economy as events;
 use batch::{BatchManager, BatchResult, BatchTransferItem, MAX_BATCH_SIZE};
@@ -453,6 +455,15 @@ impl VirtualEconomyContract {
     ) -> Result<BytesN<32>, VirtualEconomyError> {
         Self::require_authorized_minter(&env)?;
 
+        // Creator royalties are configurable 0-10% (#913). This was
+        // previously unenforced at mint time — `NFTManager::validate_metadata`
+        // in nft.rs carried the same check but was never called from here,
+        // so a royalty above the cap could be minted and only rejected later
+        // by `update_royalty_bps`.
+        if metadata.royalty_bps > 1000 {
+            return Err(VirtualEconomyError::RoyaltyTooHigh);
+        }
+
         let final_token_id = if let Some(id) = token_id {
             // Check if token already exists
             if env
@@ -506,8 +517,75 @@ impl VirtualEconomyContract {
             .instance()
             .set(&DataKey::EconomyAnalytics, &analytics);
 
+        // Collection support (#913): if `category` names a registered
+        // collection, count this mint toward it. Minting into an
+        // unregistered category still succeeds — collections are opt-in.
+        if let Some(mut collection) = env
+            .storage()
+            .persistent()
+            .get::<_, NFTCollection>(&DataKey::Collection(metadata.category.clone()))
+        {
+            collection.item_count += 1;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Collection(metadata.category.clone()), &collection);
+        }
+
         events::emit_nft_minted(&env, &final_token_id, &owner, &metadata.name);
         Ok(final_token_id)
+    }
+
+    /// Register a named NFT collection (#913). `category` on future mints
+    /// must match `name` exactly for those NFTs to count toward it.
+    pub fn create_collection(
+        env: Env,
+        creator: Address,
+        name: String,
+        default_royalty_bps: u32,
+    ) -> Result<(), VirtualEconomyError> {
+        creator.require_auth();
+
+        if default_royalty_bps > 1000 {
+            return Err(VirtualEconomyError::RoyaltyTooHigh);
+        }
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Collection(name.clone()))
+        {
+            return Err(VirtualEconomyError::InvalidConfig);
+        }
+
+        let collection = NFTCollection {
+            name: name.clone(),
+            creator,
+            default_royalty_bps,
+            item_count: 0,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Collection(name), &collection);
+        Ok(())
+    }
+
+    /// Get a registered NFT collection's info, including its live item count (#913).
+    pub fn get_collection(env: Env, name: String) -> Result<NFTCollection, VirtualEconomyError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Collection(name))
+            .ok_or(VirtualEconomyError::TokenNotFound)
+    }
+
+    /// ERC-721-style alias for the number of NFTs an address owns (#913).
+    pub fn balance_of(env: Env, owner: Address) -> u32 {
+        Self::get_owned_nfts(env, owner).len()
+    }
+
+    /// ERC-721-style alias for an NFT's metadata URI (#913) — this contract
+    /// stores full on-chain metadata rather than an off-chain URI, so this
+    /// returns the NFT's `image_url` as the closest equivalent.
+    pub fn token_uri(env: Env, token_id: BytesN<32>) -> Result<String, VirtualEconomyError> {
+        Ok(Self::get_nft_metadata(env, token_id)?.image_url)
     }
 
     /// Transfer NFT between addresses
@@ -811,6 +889,10 @@ impl VirtualEconomyContract {
             .instance()
             .set(&DataKey::EconomyAnalytics, &analytics);
 
+        // Accrue trading-rebate volume for both sides of the trade (#916).
+        Self::record_trade_volume(&env, &buyer, order.price);
+        Self::record_trade_volume(&env, &order.seller, order.price);
+
         events::emit_marketplace_trade_executed(
             &env,
             &order_id,
@@ -1065,6 +1147,10 @@ impl VirtualEconomyContract {
         env.storage()
             .instance()
             .set(&DataKey::PricingAnalytics, &analytics);
+
+        // Accrue trading-rebate volume for both sides of the trade (#916).
+        Self::record_trade_volume(&env, &buyer, price);
+        Self::record_trade_volume(&env, &listing.seller, price);
 
         events::emit_dutch_auction_purchased(&env, &listing_id, &buyer, price);
         Ok(())
@@ -1523,6 +1609,207 @@ impl VirtualEconomyContract {
 
     pub fn get_referral_config(env: Env) -> Option<ReferralConfig> {
         env.storage().instance().get(&DataKey::ReferralConfig)
+    }
+
+    // -------------------------------------------------------------------------
+    // Trading Rebates (#916)
+    //
+    // Every buyer and seller in `execute_marketplace_trade` and
+    // `purchase_dutch_auction` automatically accrues trade volume. An admin
+    // periodically (at most once per `period_seconds`, default 30 days)
+    // triggers `calculate_monthly_rebates`, which pays every tracked trader
+    // a rebate — 1% / 2% / 5% of their accrued volume, based on which tier
+    // threshold it cleared — directly into their currency balance, then
+    // resets their volume for the next period. History is kept per trader
+    // for dashboard visibility.
+    // -------------------------------------------------------------------------
+
+    /// Configure the tiered rebate thresholds and distribution period. Rates
+    /// are fixed at 1% / 2% / 5% per the tiered-rebate spec; only the volume
+    /// thresholds and cadence are admin-configurable.
+    pub fn configure_rebates(
+        env: Env,
+        tier1_min_volume: i128,
+        tier2_min_volume: i128,
+        tier3_min_volume: i128,
+        period_seconds: u64,
+    ) -> Result<(), VirtualEconomyError> {
+        Self::require_admin(&env)?;
+        if tier1_min_volume <= 0
+            || tier2_min_volume <= tier1_min_volume
+            || tier3_min_volume <= tier2_min_volume
+            || period_seconds == 0
+        {
+            return Err(VirtualEconomyError::InvalidConfig);
+        }
+        let config = RebateConfig {
+            tier1_min_volume,
+            tier2_min_volume,
+            tier3_min_volume,
+            tier1_bps: 100,
+            tier2_bps: 200,
+            tier3_bps: 500,
+            period_seconds,
+        };
+        env.storage().instance().set(&DataKey::RebateConfig, &config);
+        Ok(())
+    }
+
+    pub fn get_rebate_config(env: Env) -> Option<RebateConfig> {
+        env.storage().instance().get(&DataKey::RebateConfig)
+    }
+
+    /// Current accrued volume for `trader` since the last monthly run.
+    pub fn get_trader_volume(env: Env, trader: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TraderVolume(trader))
+            .unwrap_or(0)
+    }
+
+    /// The rebate tier `trader` currently qualifies for, in basis points.
+    /// Zero if no rebate configuration exists or volume clears no tier.
+    pub fn get_rebate_tier_bps(env: Env, trader: Address) -> u32 {
+        let config = match Self::get_rebate_config(env.clone()) {
+            Some(c) => c,
+            None => return 0,
+        };
+        let volume = Self::get_trader_volume(env, trader);
+        Self::rebate_tier_bps(&config, volume)
+    }
+
+    fn rebate_tier_bps(config: &RebateConfig, volume: i128) -> u32 {
+        if volume >= config.tier3_min_volume {
+            config.tier3_bps
+        } else if volume >= config.tier2_min_volume {
+            config.tier2_bps
+        } else if volume >= config.tier1_min_volume {
+            config.tier1_bps
+        } else {
+            0
+        }
+    }
+
+    /// Accrue `amount` of trade volume for `trader` and, if this is their
+    /// first accrual since the last reset, add them to the tracked-trader
+    /// list so a monthly run can find them.
+    fn record_trade_volume(env: &Env, trader: &Address, amount: i128) {
+        if amount <= 0 {
+            return;
+        }
+        let key = DataKey::TraderVolume(trader.clone());
+        let existing: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        if existing == 0 {
+            let mut tracked: Vec<Address> = env
+                .storage()
+                .instance()
+                .get(&DataKey::TrackedTraders)
+                .unwrap_or_else(|| Vec::new(env));
+            if !tracked.iter().any(|a| a == *trader) {
+                tracked.push_back(trader.clone());
+                env.storage()
+                    .instance()
+                    .set(&DataKey::TrackedTraders, &tracked);
+            }
+        }
+        env.storage().persistent().set(&key, &(existing + amount));
+    }
+
+    /// Pay every tracked trader their tiered rebate and reset their volume
+    /// for the next period. Callable by anyone, but rate-limited to once per
+    /// `period_seconds` so it acts as a monthly settlement point. Returns
+    /// the number of traders rebated.
+    pub fn calculate_monthly_rebates(env: Env) -> Result<u32, VirtualEconomyError> {
+        let config = env
+            .storage()
+            .instance()
+            .get::<_, RebateConfig>(&DataKey::RebateConfig)
+            .ok_or(VirtualEconomyError::InvalidConfig)?;
+
+        let now = env.ledger().timestamp();
+        if let Some(last_run) = env.storage().instance().get::<_, u64>(&DataKey::LastRebateRun) {
+            if now < last_run + config.period_seconds {
+                return Err(VirtualEconomyError::ReferralCooldown);
+            }
+        }
+
+        let tracked: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::TrackedTraders)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let currency_config = Self::get_currency_config(&env);
+        let mut supply = Self::get_total_currency_supply(env.clone());
+
+        let mut paid_count = 0u32;
+        for trader in tracked.iter() {
+            let volume_key = DataKey::TraderVolume(trader.clone());
+            let volume: i128 = env.storage().persistent().get(&volume_key).unwrap_or(0);
+            let bps = Self::rebate_tier_bps(&config, volume);
+
+            if bps > 0 {
+                let amount = volume * bps as i128 / 10_000;
+                // A rebate mints new currency (like referral rewards do)
+                // rather than draining a pool, so it stays capped by the
+                // configured max supply.
+                if amount > 0 && supply + amount <= currency_config.max_supply {
+                    let balance = Self::get_currency_balance(env.clone(), trader.clone());
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::CurrencyBalance(trader.clone()), &(balance + amount));
+                    supply += amount;
+
+                    let mut history: Vec<RebatePayout> = env
+                        .storage()
+                        .persistent()
+                        .get(&DataKey::RebateHistory(trader.clone()))
+                        .unwrap_or_else(|| Vec::new(&env));
+                    history.push_back(RebatePayout { volume, bps, amount, paid_at: now });
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::RebateHistory(trader.clone()), &history);
+
+                    paid_count += 1;
+                }
+            }
+
+            // Volume resets every period regardless of whether a tier was
+            // met, and the trader drops out of the tracked list until their
+            // next trade re-adds them.
+            env.storage().persistent().remove(&volume_key);
+        }
+
+        let total_rebated = supply - Self::get_total_currency_supply(env.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalCurrencySupply, &supply);
+        if total_rebated > 0 {
+            let mut analytics = Self::get_economy_analytics(env.clone());
+            analytics.total_currency_minted += total_rebated;
+            env.storage()
+                .instance()
+                .set(&DataKey::EconomyAnalytics, &analytics);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::TrackedTraders, &Vec::<Address>::new(&env));
+        env.storage().instance().set(&DataKey::LastRebateRun, &now);
+
+        Ok(paid_count)
+    }
+
+    /// Rebate payout history for `trader`, most recent last — for dashboard
+    /// visibility.
+    pub fn get_rebate_history(env: Env, trader: Address) -> Vec<RebatePayout> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RebateHistory(trader))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    pub fn get_last_rebate_run(env: Env) -> u64 {
+        env.storage().instance().get(&DataKey::LastRebateRun).unwrap_or(0)
     }
 
     // -------------------------------------------------------------------------
@@ -2620,7 +2907,8 @@ impl VirtualEconomyContract {
             return Err(VirtualEconomyError::Unauthorized);
         }
 
-        if new_bps > 2000 {
+        // Configurable 0-10% (#913).
+        if new_bps > 1000 {
             return Err(VirtualEconomyError::RoyaltyTooHigh);
         }
 

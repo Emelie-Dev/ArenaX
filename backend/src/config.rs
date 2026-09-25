@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::env;
 
-#lderive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub database: DatabaseConfig,
     pub redis: RedisConfig,
@@ -13,9 +13,10 @@ pub struct Config {
     pub server: ServerConfig,
     pub rate_limit: RateLimitConfig,
     pub idempotency: IdempotencyConfig,
+    pub push: PushConfig,
 }
 
-#lderive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct DatabaseConfig {
     pub url: String,
     pub migration_mode: MigrationMode,
@@ -43,18 +44,18 @@ fn env_u32(key: &str, default: u32) -> u32 {
     env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
 }
 
-#lderive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub enum MigrationMode {
     Run,
     Disabled,
 }
 
 impl MigrationMode {
-    fn from_env_value(value: &str) -> Result<Self, anyhow*::Error> {
+    fn from_env_value(value: &str) -> Result<Self, anyhow::Error> {
         match value.trim().to_ascii_lowercase().as_str() {
             "run" | "auto" | "true" | "1" => Ok(Self::Run),
             "disabled" | "disable" | "off" | "false" | "0" => Ok(Self::Disabled),
-            other => anyhow*:bail(!
+            other => anyhow::bail!(
                 "invalid BACKEND_MIGRATION_MODE value `{}`; expected `run` or `disabled`",
                 other
             ),
@@ -62,12 +63,12 @@ impl MigrationMode {
     }
 }
 
-#derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct RedisConfig {
     pub url: String,
 }
 
-#derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct StorageConfig {
     pub s3_endpoint: String,
     pub s3_access_key: String,
@@ -75,13 +76,13 @@ pub struct StorageConfig {
     pub s3_bucket: String,
 }
 
-#derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct PaymentsConfig {
     pub paystack_secret: String,
     pub flutterwave_secret: String,
 }
 
-#derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct AuthConfig {
     pub jwt_secret: String,
     /// Duration string for the short-lived access token, e.g. "15m".
@@ -91,7 +92,7 @@ pub struct AuthConfig {
     pub jwt_refresh_expires_in: String,
 }
 
-#derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct StellarConfig {
     pub network_url: String,
     pub admin_secret: String,
@@ -105,12 +106,12 @@ pub struct StellarConfig {
     pub soroban_contract_match: String,
 }
 
-#derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct AiConfig {
     pub model_path: String,
 }
 
-#derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ServerConfig {
     pub port: u16,
     pub host: String,
@@ -121,24 +122,35 @@ fn default_rate_limit_headers() -> bool {
     true
 }
 
-#derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct RateLimitConfig {
     pub requests: u32,
     pub window: u64,
     /// Whether to send rate limit headers (`RateLimit-Limit`, `RateLimit-Remaining`,
     /// `RateLimit-Reset`) on responses. Defaults to `true`.
-    #serde(default = "default_rate_limit_headers")
+    #[serde(default = "default_rate_limit_headers")]
     pub headers: bool,
 }
 
-#derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct IdempotencyConfig {
     pub ttl_seconds: u64,
     pub max_response_size_kb: u32,
 }
 
+/// Firebase Cloud Messaging credentials (#908). Both fields are optional so
+/// deployments that haven't set up push yet still start; `PushNotificationService`
+/// degrades to always-fallback-to-in-app when either is unset.
+#[derive(Debug, Deserialize, Clone)]
+pub struct PushConfig {
+    pub fcm_project_id: Option<String>,
+    /// Raw service-account JSON contents (not a file path), matching how
+    /// other secrets are passed as env var values in this codebase.
+    pub fcm_service_account_json: Option<String>,
+}
+
 impl Config {
-    pub fn from_env() -> Result<Self, anyhow*:Error> {
+    pub fn from_env() -> Result<Self, anyhow::Error> {
         dotenvy::dotenv().ok();
 
         let database_url = env::var("DATABASE_URL")?;
@@ -179,12 +191,14 @@ impl Config {
         let idempotency_max_response_size_kb: u32 = env::var("IDEMPOTENCY_MAX_RESPONSE_SIZE_KB")
             .unwrap_or_else(|_| "1024".to_string())
             .parse()?;
+        let fcm_project_id = env::var("FCM_PROJECT_ID").ok();
+        let fcm_service_account_json = env::var("FCM_SERVICE_ACCOUNT_JSON").ok();
 
         Ok(Config {
             database: DatabaseConfig {
                 url: database_url,
                 migration_mode,
-                max_connections: env_u32("DATABASE_MAX_CONNECTIONS", 20);
+                max_connections: env_u32("DATABASE_MAX_CONNECTIONS", 20),
                 acquire_timeout_secs: env_u64("DATABASE_ACQUIRE_TIMEOUT_SECS", 2),
                 health_check_interval_secs: env_u64("DATABASE_HEALTH_INTERVAL_SECS", 10),
                 circuit_failure_threshold: env_u32("DATABASE_CIRCUIT_FAILURES", 3),
@@ -230,6 +244,10 @@ impl Config {
             idempotency: IdempotencyConfig {
                 ttl_seconds: idempotency_ttl_seconds,
                 max_response_size_kb: idempotency_max_response_size_kb,
+            },
+            push: PushConfig {
+                fcm_project_id,
+                fcm_service_account_json,
             },
         })
     }

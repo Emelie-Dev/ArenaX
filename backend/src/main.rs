@@ -172,6 +172,21 @@ async fn main() -> io::Result<()> {
     // Initialize BatchService — Issue #952
     let batch_service = Arc::new(BatchService::new(db_pool.clone()));
 
+    // Push notification service (FCM) — Issue #908. Both env vars are
+    // optional; when unset the service always falls back to in-app
+    // notifications rather than failing to start.
+    let fcm_config = match (&config.push.fcm_project_id, &config.push.fcm_service_account_json) {
+        (Some(project_id), Some(service_account_json)) => Some(crate::service::FcmConfig {
+            project_id: project_id.clone(),
+            service_account_json: service_account_json.clone(),
+        }),
+        _ => {
+            tracing::warn!("FCM not configured (FCM_PROJECT_ID / FCM_SERVICE_ACCOUNT_JSON unset); push notifications will fall back to in-app only");
+            None
+        }
+    };
+    let push_notification_service = Arc::new(crate::service::PushNotificationService::new(fcm_config));
+
     // Initialize real-time infrastructure
     let event_bus = EventBus::new(redis_conn.clone());
     let session_registry = Arc::new(SessionRegistry::new());
@@ -228,6 +243,7 @@ async fn main() -> io::Result<()> {
             .app_data(web::Data::new(batch_service.clone()))
             .app_data(web::Data::new(match_authority_service.clone()))
             .app_data(web::Data::new(protocol_signer_secret.clone()))
+            .app_data(web::Data::new(push_notification_service.clone()))
             .wrap(IdempotencyMiddleware::new(redis_conn.clone(), idempotency_policy.clone()))
             .wrap(RateLimitMiddleware::new(redis_conn.clone(), rate_limit_config.clone()))
             .wrap(SecurityMiddleware::new(redis_conn.clone(), SecurityConfig::default()))
@@ -281,6 +297,13 @@ async fn main() -> io::Result<()> {
                     .route(
                         "/notifications/{id}",
                         web::delete().to(crate::http::notification_handler::delete_notification),
+                    )
+                    // Push notification service (FCM) — Issue #908
+                    .service(
+                        web::scope("/push")
+                            .route("/devices", web::post().to(crate::http::push_notification_handler::register_device))
+                            .route("/devices", web::delete().to(crate::http::push_notification_handler::unregister_device))
+                            .route("/send/{user_id}", web::post().to(crate::http::push_notification_handler::send_push_to_user)),
                     )
                     // Wallet endpoints
                     .service(
