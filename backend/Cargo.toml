@@ -45,6 +45,9 @@ once_cell = "1.19"
 prometheus = { version = "0.13", features = ["process"] }
 aes-gcm = { version = "0.10", features = ["zeroize"] }
 zeroize = { version = "1.8", features = ["derive"] }
+# Needed for the EmailTransport trait (Issue #905): async fns in traits still
+# require boxing on this toolchain.
+async-trait = "0.1"
 
 
 # Security: pin patched versions of transitive deps

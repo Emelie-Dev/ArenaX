@@ -13,7 +13,10 @@ pub mod match_authority_handler;
 pub mod matchmaking;
 #[deprecated(note = "Use realtime::user_ws instead for authenticated WebSocket connections")]
 pub mod match_ws_handler;
+pub mod cache_handler;
+pub mod email_handler;
 pub mod notification_handler;
+pub mod suspension_handler;
 pub mod player_stats_handler;
 pub mod reputation_handler;
 pub mod social_handler;
