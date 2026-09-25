@@ -45,6 +45,8 @@ once_cell = "1.19"
 prometheus = { version = "0.13", features = ["process"] }
 aes-gcm = { version = "0.10", features = ["zeroize"] }
 zeroize = { version = "1.8", features = ["derive"] }
+# sqlx's ConnectOptions::log_slow_statements/log_statements take log::LevelFilter (#1084)
+log = "0.4"
 
 
 # Security: pin patched versions of transitive deps
