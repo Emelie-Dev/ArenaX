@@ -1,5 +1,7 @@
 // Service layer module for ArenaX
 pub mod achievement_service;
+pub mod email_service;
+pub mod suspension_service;
 pub mod analytics_service;
 pub mod auth_service;
 pub mod dispute_service;
