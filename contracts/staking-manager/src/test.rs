@@ -1208,3 +1208,52 @@ fn test_lp_create_pool_il_bps_exceeds_10000_fails() {
     env.mock_all_auths();
     client.create_lp_pool(&1_000u32, &10_001u32);
 }
+
+#[test]
+fn test_validator_slash_history_pagination() {
+    let (env, admin, validator, _user2) = create_test_env();
+    let contract_id = initialize_contract(&env, &admin);
+    let client = StakingManagerClient::new(&env, &contract_id);
+
+    let config = SlashConfig {
+        enabled: true,
+        slash_amounts: Vec::from_array(&env, [100i128, 200i128, 300i128, 400i128, 500i128]),
+        burn_bps: 0,
+        appeal_window_seconds: 10_000,
+    };
+
+    env.mock_all_auths();
+    client.configure_slashing(&config);
+
+    env.as_contract(&contract_id, || {
+        let stake_info = UserStakeInfo {
+            user: validator.clone(),
+            total_staked: 1_000i128,
+            total_slashed: 0,
+            active_tournaments: 0,
+            completed_tournaments: 0,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::UserStakeInfo(validator.clone()), &stake_info);
+    });
+
+    let mut slash_ids = Vec::new(&env);
+    for severity in [0u32, 1u32, 2u32] {
+        let slash_id = client.slash_validator(&admin, &validator, &severity, &1u32);
+        slash_ids.push_back(slash_id);
+    }
+
+    let history = client.get_slash_history(&validator);
+    assert_eq!(history.slash_count, 3);
+    assert_eq!(history.slash_ids.len(), 3);
+
+    let page_1 = client.get_slash_records_paginated(&validator, &0u32, &2u32);
+    assert_eq!(page_1.len(), 2);
+    assert_eq!(page_1.get(0).unwrap().slash_id, slash_ids.get(0).unwrap());
+    assert_eq!(page_1.get(1).unwrap().slash_id, slash_ids.get(1).unwrap());
+
+    let page_2 = client.get_slash_records_paginated(&validator, &2u32, &2u32);
+    assert_eq!(page_2.len(), 1);
+    assert_eq!(page_2.get(0).unwrap().slash_id, slash_ids.get(2).unwrap());
+}
