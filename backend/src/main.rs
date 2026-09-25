@@ -265,6 +265,10 @@ async fn main() -> io::Result<()> {
             // correlation id) and the response last (records latency,
             // stamps correlation headers) among the "inner" layers below.
             .wrap(RequestTracing::new())
+                        // Reports 5xx responses and panics from any layer inside this
+            // one to Sentry (see telemetry.rs::init_sentry — no-op when
+            // SENTRY_DSN is unset).
+            .wrap(sentry_actix::Sentry::new())
             // Outermost: guarantees security headers land on every response,
             // including ones short-circuited by an inner layer (CORS
             // preflight, CSRF rejection, rate limiting, etc).
