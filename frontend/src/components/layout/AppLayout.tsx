@@ -13,6 +13,7 @@ import { PageTransition } from "@/components/layout/PageTransition";
 import { KeyboardShortcutsHelp } from "@/components/ui/KeyboardShortcutsHelp";
 import { useKeyboardShortcuts } from "@/hooks/useKeyboardShortcuts";
 import { SessionTimeoutProvider } from "@/contexts/SessionTimeoutContext";
+import { SessionExpiryWarningModal } from "@/components/ui/SessionExpiryWarningModal";
 // #759: next-intl's Link, not next/link. It prefixes the active locale
 // automatically, so "/about" resolves to "/en/about" and following a footer
 // link never resets the user's language.
@@ -115,8 +116,9 @@ export function AppLayout({ children }: AppLayoutProps) {
         </div>
       </footer>
       
-      {/* Session timeout warning modal - to be integrated by consumer */}
-      
+      {/* JWT-expiry countdown warning — 2 min before the access token expires (#1090) */}
+      <SessionExpiryWarningModal />
+
       </div>
     </SessionTimeoutProvider>
   );
