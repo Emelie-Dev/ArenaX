@@ -65,38 +65,32 @@ impl LeaderboardService {
         limit: i64,
         offset: i64,
     ) -> Result<LeaderboardResponse, ApiError> {
-        // Serve from cache when we can. This is the single heaviest read on the
-        // platform — a join plus a window-function count over every row of the
-        // board, run on every page view (Issue #910).
-        if let Some(cache) = &self.cache {
-            let key = cache_keys::leaderboard(category, limit, offset);
-            if let Some(hit) = cache
-                .get::<LeaderboardResponse>(&key, cache_policies::LEADERBOARD)
-                .await
-            {
-                return Ok(hit.value);
-            }
-        }
-
-        // Optimized: use window function to get count in same query
-        let entries = sqlx::query_as::<_, (Uuid, Uuid, String, Option<String>, i32, i32, i32, i32, i32, f64, String, DateTime<Utc>, i64)>(
-            r#"
-            SELECT 
-                l.id, l.user_id, u.username, u.avatar_url,
-                l.ranking, l.elo_rating, l.matches_played, l.wins, l.losses, l.win_rate,
-                l.period, l.updated_at,
-                COUNT(*) OVER() as total_count
-            FROM leaderboards l
-            INNER JOIN users u ON l.user_id = u.id
-            WHERE l.game = $1 AND l.period = 'all_time'
-            ORDER BY l.ranking ASC
-            LIMIT $2 OFFSET $3
-            "#
+        // Optimized: use window function to get count in same query.
+        // Wrapped in `time_query` (#1084) — this endpoint is hit on every
+        // leaderboard page load, so it's exactly the kind of query a
+        // `db_query_duration_seconds{query_name="leaderboard.get_leaderboard"}`
+        // P99 alert should watch.
+        let entries = crate::metrics::time_query(
+            "leaderboard.get_leaderboard",
+            sqlx::query_as::<_, (Uuid, Uuid, String, Option<String>, i32, i32, i32, i32, i32, f64, String, DateTime<Utc>, i64)>(
+                r#"
+                SELECT
+                    l.id, l.user_id, u.username, u.avatar_url,
+                    l.ranking, l.elo_rating, l.matches_played, l.wins, l.losses, l.win_rate,
+                    l.period, l.updated_at,
+                    COUNT(*) OVER() as total_count
+                FROM leaderboards l
+                INNER JOIN users u ON l.user_id = u.id
+                WHERE l.game = $1 AND l.period = 'all_time'
+                ORDER BY l.ranking ASC
+                LIMIT $2 OFFSET $3
+                "#
+            )
+            .bind(category)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.db_pool),
         )
-        .bind(category)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.db_pool)
         .await
         .map_err(|e| ApiError::DatabaseError(e))?;
 

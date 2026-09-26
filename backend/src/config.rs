@@ -32,6 +32,13 @@ pub struct DatabaseConfig {
     pub circuit_failure_threshold: u32,
     /// How long the breaker stays open before admitting a trial request.
     pub circuit_open_secs: u64,
+    /// PostgreSQL `statement_timeout` applied to every connection (#1084):
+    /// a slow query or deadlock is cancelled instead of holding a pool
+    /// connection indefinitely. `DATABASE_STATEMENT_TIMEOUT_MS`, default 5000.
+    pub statement_timeout_ms: u64,
+    /// Queries slower than this are logged at WARN with their SQL and
+    /// duration (#1084). `DATABASE_SLOW_QUERY_THRESHOLD_MS`, default 200.
+    pub slow_query_threshold_ms: u64,
 }
 
 /// Read a `u64` from the environment, falling back when unset or unparseable.
@@ -203,6 +210,8 @@ impl Config {
                 health_check_interval_secs: env_u64("DATABASE_HEALTH_INTERVAL_SECS", 10),
                 circuit_failure_threshold: env_u32("DATABASE_CIRCUIT_FAILURES", 3),
                 circuit_open_secs: env_u64("DATABASE_CIRCUIT_OPEN_SECS", 30),
+                statement_timeout_ms: env_u64("DATABASE_STATEMENT_TIMEOUT_MS", 5000),
+                slow_query_threshold_ms: env_u64("DATABASE_SLOW_QUERY_THRESHOLD_MS", 200),
             },
             redis: RedisConfig { url: redis_url },
             storage: StorageConfig {

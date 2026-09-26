@@ -6,6 +6,7 @@ pub mod user_ws;
 pub mod session_registry;
 pub mod auth;
 pub mod redis_client;
+pub mod rate_limiter;
 
 pub use events::*;
 pub use event_bus::EventBus;

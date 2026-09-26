@@ -63,12 +63,19 @@ groups:
           summary: "arenax-backend resident memory above 1.5GB"
           description: "Process RSS has been above 1.5GB for 10 minutes — check for leaks or scale up."
 
-      - alert: SorobanDlqBacklog
-        expr: soroban_dlq_depth{job="arenax-backend"} > 10
+      - alert: BackendSlowNamedQueryP99
+        # db_query_duration_seconds is only observed at the call sites wrapped
+        # in metrics::time_query (#1084) — currently a representative subset,
+        # not every query in the codebase.
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum(rate(db_query_duration_seconds_bucket{job="arenax-backend"}[5m])) by (le, query_name)
+          ) > 1
         for: 5m
         labels:
-          severity: critical
+          severity: warning
           service: arenax-backend
         annotations:
-          summary: "arenax-backend Soroban dead-letter queue above 10 entries"
-          description: "More than 10 Soroban transactions have been in the dead-letter queue for 5 minutes. On-chain actions (payouts, match results) are not landing; inspect the DLQ and retry or resolve them."
+          summary: "arenax-backend named query P99 above 1s"
+          description: "Query {{ $labels.query_name }} has had a P99 latency above 1 second for 5 minutes."
