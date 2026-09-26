@@ -29,6 +29,7 @@ use crate::middleware::metrics_middleware::RequestMetrics;
 use crate::middleware::rate_limit::RateLimitMiddleware;
 use crate::middleware::security::{SecurityConfig, SecurityMiddleware};
 use crate::middleware::security_headers::security_headers;
+use crate::middleware::tenant_context::TenantContextMiddleware;
 use crate::middleware::tracing_middleware::RequestTracing;
 use crate::models::idempotency::IdempotencyPolicy;
 use crate::service::batch_service::BatchService;
@@ -178,20 +179,12 @@ async fn main() -> io::Result<()> {
     // Initialize BatchService — Issue #952
     let batch_service = Arc::new(BatchService::new(db_pool.clone()));
 
-    // Push notification service (FCM) — Issue #908. Both env vars are
-    // optional; when unset the service always falls back to in-app
-    // notifications rather than failing to start.
-    let fcm_config = match (&config.push.fcm_project_id, &config.push.fcm_service_account_json) {
-        (Some(project_id), Some(service_account_json)) => Some(crate::service::FcmConfig {
-            project_id: project_id.clone(),
-            service_account_json: service_account_json.clone(),
-        }),
-        _ => {
-            tracing::warn!("FCM not configured (FCM_PROJECT_ID / FCM_SERVICE_ACCOUNT_JSON unset); push notifications will fall back to in-app only");
-            None
-        }
-    };
-    let push_notification_service = Arc::new(crate::service::PushNotificationService::new(fcm_config));
+    // Fan-out notification delivery (in-app/push/email) — Issue #1107
+    let notification_service = Arc::new(crate::service::notification_service::NotificationService::new(
+        db_pool.clone(),
+        config.notifications.sendgrid_api_key.clone(),
+        config.notifications.sendgrid_from_email.clone(),
+    ));
 
     // Initialize real-time infrastructure
     let event_bus = EventBus::new(redis_conn.clone());
@@ -274,9 +267,10 @@ async fn main() -> io::Result<()> {
             .app_data(web::Data::new(tournament_service.clone()))
             // Match authority service + protocol signer for on-chain match lifecycle
             .app_data(web::Data::new(batch_service.clone()))
+            .app_data(web::Data::new(notification_service.clone()))
             .app_data(web::Data::new(match_authority_service.clone()))
             .app_data(web::Data::new(protocol_signer_secret.clone()))
-            .app_data(web::Data::new(push_notification_service.clone()))
+            .wrap(TenantContextMiddleware)
             .wrap(IdempotencyMiddleware::new(redis_conn.clone(), idempotency_policy.clone()))
             .wrap(RateLimitMiddleware::new(redis_conn.clone(), rate_limit_config.clone()))
             .wrap(SecurityMiddleware::new(redis_conn.clone(), SecurityConfig::default()))

@@ -14,7 +14,7 @@ pub mod leaderboard_service;
 pub mod match_authority_service;
 pub mod match_service;
 pub mod match_service_background;
-pub mod payment_provider;
+pub mod notification_service;
 pub mod player_stats_service;
 pub mod push_notification_service;
 pub mod reaper_service;

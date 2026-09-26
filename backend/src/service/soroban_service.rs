@@ -112,6 +112,44 @@ impl Default for RetryConfig {
 
 /// Soroban service for transaction management
 #[derive(Clone)]
+/// Lifecycle stage of a structured Soroban transaction log line (#1106).
+/// `correlation_id` isn't a field here — it's already on the ambient
+/// `http.request` tracing span and captured by any subscriber walking the
+/// span stack. Never pass a signer secret through here — only identifiers.
+#[derive(Debug, Clone, Copy)]
+enum SorobanEventStatus {
+    Submit,
+    Confirm,
+    Retry,
+    Dlq,
+}
+
+impl SorobanEventStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Submit => "submit",
+            Self::Confirm => "confirm",
+            Self::Retry => "retry",
+            Self::Dlq => "dlq",
+        }
+    }
+}
+
+fn log_soroban_event(status: SorobanEventStatus, tx_hash: &str, contract: &str, method: &str) {
+    let status_str = status.as_str();
+    match status {
+        SorobanEventStatus::Submit | SorobanEventStatus::Confirm => {
+            info!(tx_hash, contract, method, status = status_str, "Soroban transaction event");
+        }
+        SorobanEventStatus::Retry => {
+            warn!(tx_hash, contract, method, status = status_str, "Soroban transaction retry");
+        }
+        SorobanEventStatus::Dlq => {
+            error!(tx_hash, contract, method, status = status_str, "Soroban transaction moved to dead-letter queue");
+        }
+    }
+}
+
 pub struct SorobanService {
     network: NetworkConfig,
     client: reqwest::Client,
@@ -305,31 +343,15 @@ impl SorobanService {
             .inspect_err(|_| fail("build"))?;
 
         // Step 3: Submit the transaction
-        let tx_hash = self
-            .send_transaction(&signed_tx)
-            .await
-            .inspect_err(|_| fail("submission"))?;
+        let tx_hash = self.send_transaction(&signed_tx).await?;
+        log_soroban_event(SorobanEventStatus::Submit, &tx_hash, contract_id, function_name);
 
         // Step 4: Monitor the transaction
-        let result = match self
+        let result = self
             .monitor_transaction(&tx_hash, contract_id, function_name)
             .await
-        {
-            Ok(result) => {
-                match result.status {
-                    TxStatus::Success => crate::metrics::record_soroban_success(
-                        contract_id,
-                        function_name,
-                        started.elapsed().as_secs_f64(),
-                    ),
-                    TxStatus::Failed => fail("on_chain"),
-                    // Still pending after every retry: the service gave up
-                    // waiting, so this is a final outcome for the caller.
-                    TxStatus::Pending => fail("unconfirmed"),
-                }
-                result
-            }
-            Err(e) => {
+            .unwrap_or_else(|e| {
+                log_soroban_event(SorobanEventStatus::Dlq, &tx_hash, contract_id, function_name);
                 warn!(tx_hash = tx_hash, error = %e, "Failed to monitor transaction");
                 fail("monitor_error");
                 SorobanTxResult {
@@ -487,7 +509,7 @@ impl SorobanService {
                 Ok(status) => {
                     match status.as_str() {
                         "SUCCESS" => {
-                            info!(tx_hash = tx_hash, "Transaction succeeded");
+                            log_soroban_event(SorobanEventStatus::Confirm, tx_hash, contract_id, function_name);
                             return Ok(SorobanTxResult {
                                 hash: tx_hash.to_string(),
                                 status: TxStatus::Success,
@@ -496,7 +518,7 @@ impl SorobanService {
                         }
                         "FAILED" => {
                             let error_msg = format!("Transaction failed on network");
-                            error!(tx_hash = tx_hash, "Transaction failed");
+                            log_soroban_event(SorobanEventStatus::Dlq, tx_hash, contract_id, function_name);
                             return Ok(SorobanTxResult {
                                 hash: tx_hash.to_string(),
                                 status: TxStatus::Failed,
@@ -506,12 +528,14 @@ impl SorobanService {
                         "NOT_FOUND" => {
                             // Transaction not yet found, wait and retry
                             if attempt >= self.retry_config.max_retries {
+                                log_soroban_event(SorobanEventStatus::Dlq, tx_hash, contract_id, function_name);
                                 return Err(SorobanError::RetryLimitExceeded);
                             }
                         }
                         _ => {
                             // Pending or other status, wait and retry
                             if attempt >= self.retry_config.max_retries {
+                                log_soroban_event(SorobanEventStatus::Dlq, tx_hash, contract_id, function_name);
                                 return Ok(SorobanTxResult {
                                     hash: tx_hash.to_string(),
                                     status: TxStatus::Pending,
@@ -532,13 +556,14 @@ impl SorobanService {
                         "Error checking transaction status"
                     );
                     if attempt >= self.retry_config.max_retries {
+                        log_soroban_event(SorobanEventStatus::Dlq, tx_hash, contract_id, function_name);
                         return Err(e);
                     }
                 }
             }
 
             attempt += 1;
-            crate::metrics::record_soroban_retry(contract_id, function_name);
+            log_soroban_event(SorobanEventStatus::Retry, tx_hash, contract_id, function_name);
             debug!(
                 tx_hash = tx_hash,
                 attempt = attempt,
