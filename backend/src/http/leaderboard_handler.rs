@@ -3,29 +3,46 @@ use serde::Deserialize;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use std::sync::Arc;
+
 use crate::api_error::ApiError;
-use crate::auth::middleware::ClaimsExt;
-use crate::models::{CloseSeasonRequest, PaginatedResponse, PaginationParams};
+use crate::middleware::cache::ResponseCache;
+use crate::models::{PaginatedResponse, PaginationParams};
+use crate::realtime::leaderboard_broadcaster::LeaderboardBroadcaster;
 use crate::service::LeaderboardService;
 
-fn require_admin(req: &HttpRequest) -> Result<(), ApiError> {
-    let claims = req
-        .claims()
-        .ok_or_else(|| ApiError::unauthorized("Authentication required"))?;
-    if claims.roles.contains(&"admin".to_string()) {
-        Ok(())
-    } else {
-        Err(ApiError::forbidden("ROLE_ADMIN required"))
+/// Builds the service with whatever optional infrastructure is registered.
+///
+/// The cache and the broadcaster are both `Option` on the service, so a
+/// deployment without Redis still serves leaderboards — it just reads through
+/// to Postgres and pushes nothing. Centralised here so a handler cannot
+/// accidentally construct a bare service and silently lose caching
+/// (Issue #910) or real-time deltas (Issue #900).
+fn leaderboard_service(
+    pool: &web::Data<PgPool>,
+    cache: Option<&web::Data<ResponseCache>>,
+    broadcaster: Option<&web::Data<Arc<LeaderboardBroadcaster>>>,
+) -> LeaderboardService {
+    let mut service = LeaderboardService::new(pool.get_ref().clone());
+
+    if let Some(cache) = cache {
+        service = service.with_cache(cache.get_ref().clone());
     }
+    if let Some(broadcaster) = broadcaster {
+        service = service.with_broadcaster(broadcaster.get_ref().clone());
+    }
+
+    service
 }
 
 /// GET /api/v1/leaderboards/:category
 pub async fn get_leaderboard(
     pool: web::Data<PgPool>,
+    cache: Option<web::Data<ResponseCache>>,
     category: web::Path<String>,
     query: web::Query<PaginationParams>,
 ) -> Result<HttpResponse, ApiError> {
-    let service = LeaderboardService::new(pool.get_ref().clone());
+    let service = leaderboard_service(&pool, cache.as_ref(), None);
     let limit = query.resolved_limit();
     let offset = query.sql_offset();
 
@@ -100,9 +117,11 @@ pub async fn get_rank_history(
 /// POST /api/v1/leaderboards/:category/refresh
 pub async fn refresh_leaderboard(
     pool: web::Data<PgPool>,
+    cache: Option<web::Data<ResponseCache>>,
+    broadcaster: Option<web::Data<Arc<LeaderboardBroadcaster>>>,
     category: web::Path<String>,
 ) -> Result<HttpResponse, ApiError> {
-    let service = LeaderboardService::new(pool.get_ref().clone());
+    let service = leaderboard_service(&pool, cache.as_ref(), broadcaster.as_ref());
 
     service.refresh_leaderboard(&category).await?;
 
