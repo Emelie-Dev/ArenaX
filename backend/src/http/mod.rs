@@ -18,6 +18,7 @@ pub mod email_handler;
 pub mod notification_handler;
 pub mod suspension_handler;
 pub mod player_stats_handler;
+pub mod push_notification_handler;
 pub mod reputation_handler;
 pub mod social_handler;
 pub mod staking_handler;

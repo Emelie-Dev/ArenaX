@@ -13,6 +13,7 @@ pub struct Config {
     pub server: ServerConfig,
     pub rate_limit: RateLimitConfig,
     pub idempotency: IdempotencyConfig,
+    pub push: PushConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -137,6 +138,17 @@ pub struct IdempotencyConfig {
     pub max_response_size_kb: u32,
 }
 
+/// Firebase Cloud Messaging credentials (#908). Both fields are optional so
+/// deployments that haven't set up push yet still start; `PushNotificationService`
+/// degrades to always-fallback-to-in-app when either is unset.
+#[derive(Debug, Deserialize, Clone)]
+pub struct PushConfig {
+    pub fcm_project_id: Option<String>,
+    /// Raw service-account JSON contents (not a file path), matching how
+    /// other secrets are passed as env var values in this codebase.
+    pub fcm_service_account_json: Option<String>,
+}
+
 impl Config {
     pub fn from_env() -> Result<Self, anyhow::Error> {
         dotenvy::dotenv().ok();
@@ -179,6 +191,8 @@ impl Config {
         let idempotency_max_response_size_kb: u32 = env::var("IDEMPOTENCY_MAX_RESPONSE_SIZE_KB")
             .unwrap_or_else(|_| "1024".to_string())
             .parse()?;
+        let fcm_project_id = env::var("FCM_PROJECT_ID").ok();
+        let fcm_service_account_json = env::var("FCM_SERVICE_ACCOUNT_JSON").ok();
 
         Ok(Config {
             database: DatabaseConfig {
@@ -230,6 +244,10 @@ impl Config {
             idempotency: IdempotencyConfig {
                 ttl_seconds: idempotency_ttl_seconds,
                 max_response_size_kb: idempotency_max_response_size_kb,
+            },
+            push: PushConfig {
+                fcm_project_id,
+                fcm_service_account_json,
             },
         })
     }
