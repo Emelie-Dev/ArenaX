@@ -209,6 +209,7 @@ pub struct ValidatorSlashHistory {
     pub validator: Address,
     pub total_slashed: i128,
     pub slash_count: u32,
+    pub slash_ids: Vec<BytesN<32>>,
     /// `Some(slash_id)` when there is an open appeal pending resolution.
     pub active_appeal: Option<BytesN<32>>,
 }
@@ -1197,6 +1198,16 @@ impl StakingManager {
     /// Return the slash history for a validator, or `None` if never slashed.
     pub fn get_slash_history(env: Env, validator: Address) -> Option<ValidatorSlashHistory> {
         ValidatorPenaltyManager::get_slash_history(&env, validator)
+    }
+
+    /// Return slash records for a validator in slash-id order, paginated.
+    pub fn get_slash_records_paginated(
+        env: Env,
+        validator: Address,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<SlashRecord> {
+        ValidatorPenaltyManager::get_slash_records_paginated(&env, validator, offset, limit)
     }
 
     /// Return the `SlashRecord` for a given `slash_id`, or `None` if not found.
