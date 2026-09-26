@@ -113,6 +113,103 @@ pub static CIRCUIT_BREAKER_TRIPS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     counter
 });
 
+// ── Soroban transactions (#1070) ─────────────────────────────────────────────
+//
+// Labels: `contract` is the Soroban contract ID and `method` the contract
+// function name passed to `SorobanService::invoke`. Both come from code, not
+// user input, so cardinality stays bounded by the number of contract calls
+// the backend makes.
+
+pub static SOROBAN_TX_SUBMITTED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "soroban_tx_submitted_total",
+            "Soroban contract invocations attempted",
+        ),
+        &["contract", "method"],
+    )
+    .expect("metric can be created");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("metric can be registered");
+    counter
+});
+
+pub static SOROBAN_TX_SUCCESS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "soroban_tx_success_total",
+            "Soroban transactions confirmed successful on-chain",
+        ),
+        &["contract", "method"],
+    )
+    .expect("metric can be created");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("metric can be registered");
+    counter
+});
+
+pub static SOROBAN_TX_FAILED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "soroban_tx_failed_total",
+            "Soroban transactions that ended without a confirmed success",
+        ),
+        &["contract", "method", "reason"],
+    )
+    .expect("metric can be created");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("metric can be registered");
+    counter
+});
+
+pub static SOROBAN_TX_RETRIES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "soroban_tx_retries_total",
+            "Status-poll retries while waiting for a Soroban transaction to confirm",
+        ),
+        &["contract", "method"],
+    )
+    .expect("metric can be created");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("metric can be registered");
+    counter
+});
+
+pub static SOROBAN_TX_LATENCY_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+    let histogram = HistogramVec::new(
+        prometheus::HistogramOpts::new(
+            "soroban_tx_latency_seconds",
+            "End-to-end time from invoke to confirmed success, in seconds",
+        )
+        // Confirmation takes ledgers (~5s each) plus backoff, so the buckets
+        // start where HTTP latency buckets stop.
+        .buckets(vec![0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0]),
+        &["contract", "method"],
+    )
+    .expect("metric can be created");
+    REGISTRY
+        .register(Box::new(histogram.clone()))
+        .expect("metric can be registered");
+    histogram
+});
+
+pub static SOROBAN_DLQ_DEPTH: Lazy<IntGauge> = Lazy::new(|| {
+    let gauge = IntGauge::new(
+        "soroban_dlq_depth",
+        "Entries currently in the Soroban transaction dead-letter queue",
+    )
+    .expect("metric can be created");
+    REGISTRY
+        .register(Box::new(gauge.clone()))
+        .expect("metric can be registered");
+    gauge
+});
+
 /// Force all lazily-registered metrics to initialize (and therefore
 /// register with the collector registry) at startup, before the first
 /// scrape — otherwise a metric with no observations yet simply wouldn't
@@ -125,6 +222,12 @@ pub fn init_metrics() {
     Lazy::force(&CIRCUIT_BREAKER_STATE);
     Lazy::force(&CIRCUIT_BREAKER_REQUESTS_TOTAL);
     Lazy::force(&CIRCUIT_BREAKER_TRIPS_TOTAL);
+    Lazy::force(&SOROBAN_TX_SUBMITTED_TOTAL);
+    Lazy::force(&SOROBAN_TX_SUCCESS_TOTAL);
+    Lazy::force(&SOROBAN_TX_FAILED_TOTAL);
+    Lazy::force(&SOROBAN_TX_RETRIES_TOTAL);
+    Lazy::force(&SOROBAN_TX_LATENCY_SECONDS);
+    Lazy::force(&SOROBAN_DLQ_DEPTH);
 
     // Process-level metrics (process_resident_memory_bytes, process_cpu_seconds_total,
     // open fds, ...) — only available on Linux in prometheus crate.
@@ -162,6 +265,49 @@ pub fn record_circuit_breaker_trip(service: &str) {
     CIRCUIT_BREAKER_TRIPS_TOTAL
         .with_label_values(&[service])
         .inc();
+}
+
+/// A Soroban contract invocation was attempted.
+pub fn record_soroban_submitted(contract: &str, method: &str) {
+    SOROBAN_TX_SUBMITTED_TOTAL
+        .with_label_values(&[contract, method])
+        .inc();
+}
+
+/// A Soroban transaction was confirmed successful, `elapsed_secs` after the
+/// invocation started.
+pub fn record_soroban_success(contract: &str, method: &str, elapsed_secs: f64) {
+    SOROBAN_TX_SUCCESS_TOTAL
+        .with_label_values(&[contract, method])
+        .inc();
+    SOROBAN_TX_LATENCY_SECONDS
+        .with_label_values(&[contract, method])
+        .observe(elapsed_secs);
+}
+
+/// A Soroban invocation ended without a confirmed success. `reason` is one of
+/// a fixed set of values chosen in `SorobanService::invoke`.
+pub fn record_soroban_failed(contract: &str, method: &str, reason: &str) {
+    SOROBAN_TX_FAILED_TOTAL
+        .with_label_values(&[contract, method, reason])
+        .inc();
+}
+
+/// One more status poll was needed before the transaction settled.
+pub fn record_soroban_retry(contract: &str, method: &str) {
+    SOROBAN_TX_RETRIES_TOTAL
+        .with_label_values(&[contract, method])
+        .inc();
+}
+
+/// Set the current dead-letter queue depth.
+///
+/// Nothing calls this yet: the backend has no Soroban DLQ table (the handler
+/// module declared for it by #864 was never added). Whatever stores
+/// dead-lettered transactions should call this with its row count so
+/// `soroban_dlq_depth` and the `SorobanDlqBacklog` alert reflect it.
+pub fn set_soroban_dlq_depth(depth: i64) {
+    SOROBAN_DLQ_DEPTH.set(depth);
 }
 
 pub async fn metrics_handler() -> Result<HttpResponse> {

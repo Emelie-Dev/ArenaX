@@ -349,3 +349,19 @@ impl AuthService {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Carried over from the removed auth_service_updated.rs (#1068). The
+    // service hashes with DEFAULT_COST on register/change_password and
+    // checks with `verify` on login; this pins that round trip.
+    #[test]
+    fn bcrypt_hash_round_trips_and_rejects_wrong_password() {
+        let hashed = hash("test_password", DEFAULT_COST).unwrap();
+
+        assert!(verify("test_password", &hashed).unwrap());
+        assert!(!verify("wrong_password", &hashed).unwrap());
+    }
+}
