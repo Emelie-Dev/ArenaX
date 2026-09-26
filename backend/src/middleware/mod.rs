@@ -1,6 +1,7 @@
 // Middleware module for ArenaX
 
 pub mod anti_bot;
+pub mod cache;
 pub mod authorization;
 pub mod circuit_breaker;
 pub mod csrf;
@@ -13,6 +14,10 @@ pub mod security_headers;
 pub mod tracing_middleware;
 
 pub use anti_bot::AntiBotMiddleware;
+pub use cache::{
+    keys as cache_keys, policies as cache_policies, CacheHit, CacheMetricsSnapshot, CachePolicy,
+    CacheStatus, ResponseCache,
+};
 pub use authorization::{
     AccessControlEngine, AuditDecision, AuditLogEntry, AuthorizationMiddleware,
     Permission, PermissionAuditLogger, RoleHierarchy, RoleTemplate, RoleTemplateRegistry,
@@ -105,13 +110,13 @@ pub(crate) fn extract_ip(req: &ServiceRequest) -> String {
         .map(|s| s.trim().to_string())
         .or_else(|| {
             req.connection_info()
-                .realip_remote_address()
+                .realip_remote_addr()
                 .map(|s| s.to_string())
         })
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// Current time in milliseconds since UNIX EPOCH.
+/// Current time in milliseconds since UNIX epoch.
 pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

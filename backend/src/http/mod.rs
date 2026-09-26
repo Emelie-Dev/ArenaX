@@ -13,7 +13,10 @@ pub mod match_authority_handler;
 pub mod matchmaking;
 #[deprecated(note = "Use realtime::user_ws instead for authenticated WebSocket connections")]
 pub mod match_ws_handler;
+pub mod cache_handler;
+pub mod email_handler;
 pub mod notification_handler;
+pub mod suspension_handler;
 pub mod player_stats_handler;
 pub mod push_notification_handler;
 pub mod reputation_handler;
@@ -23,13 +26,6 @@ pub mod analytics_handler;
 pub mod batch_handler;
 pub mod tournament_handler;
 pub mod gas_estimation_handler;
-
-// Stellar transaction retry support (issue: backend retry logic) was declared
-// here but retry_admin_handler.rs / dead_letter_queue_handler.rs /
-// webhook_handler.rs never existed in this tree, so these `pub mod`
-// declarations broke the whole crate's build. Pre-existing, unrelated to
-// #908 — removed rather than stubbed out since nothing else in the crate
-// references them.
 
 // TODO: Add more Channel modules as implemented:
 // pub mod auth;
