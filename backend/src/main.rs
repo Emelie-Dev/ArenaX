@@ -235,7 +235,8 @@ async fn main() -> io::Result<()> {
     let auth_service = crate::service::auth_service::AuthService::new(
         db_pool.clone(),
         crate::auth::jwt_service::JwtService::new(jwt_config, redis_conn.clone()),
-    );
+    )
+    .with_redis(Arc::new(redis_client.clone()));
 
     // Start Redis Pub/Sub subscriber (broadcasts to local WebSocket actors)
     let broadcaster = WsBroadcaster::new(
@@ -258,6 +259,7 @@ async fn main() -> io::Result<()> {
         App::new()
             .app_data(web::Data::new(db_pool.clone()))
             .app_data(web::Data::new(redis_conn.clone()))
+            .app_data(web::Data::new(Arc::new(redis_client.clone())))
             .app_data(web::Data::new(auth_service.clone()))
             .app_data(web::Data::new(event_bus.clone()))
             .app_data(web::Data::new(response_cache.clone()))
@@ -318,6 +320,7 @@ async fn main() -> io::Result<()> {
                     .configure(crate::http::feature_flag_handler::configure_routes)
                     // Auth endpoints (login, register, refresh are rate-limited strictly)
                     .configure(crate::http::auth_handler::configure_routes)
+                    .configure(crate::http::users::configure_routes)
                     .route(
                         "/notifications",
                         web::get().to(crate::http::notification_handler::get_notifications),

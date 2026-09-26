@@ -10,6 +10,7 @@ use once_cell::sync::Lazy;
 use prometheus::{
     Encoder, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
 
@@ -113,20 +114,10 @@ pub static CIRCUIT_BREAKER_TRIPS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     counter
 });
 
-// ── Soroban transactions (#1070) ─────────────────────────────────────────────
-//
-// Labels: `contract` is the Soroban contract ID and `method` the contract
-// function name passed to `SorobanService::invoke`. Both come from code, not
-// user input, so cardinality stays bounded by the number of contract calls
-// the backend makes.
-
-pub static SOROBAN_TX_SUBMITTED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+pub static PROFILE_CACHE_REQUESTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     let counter = IntCounterVec::new(
-        Opts::new(
-            "soroban_tx_submitted_total",
-            "Soroban contract invocations attempted",
-        ),
-        &["contract", "method"],
+        Opts::new("profile_cache_requests_total", "Profile cache reads by outcome"),
+        &["outcome"],
     )
     .expect("metric can be created");
     REGISTRY
@@ -135,80 +126,17 @@ pub static SOROBAN_TX_SUBMITTED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     counter
 });
 
-pub static SOROBAN_TX_SUCCESS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
-    let counter = IntCounterVec::new(
-        Opts::new(
-            "soroban_tx_success_total",
-            "Soroban transactions confirmed successful on-chain",
-        ),
-        &["contract", "method"],
-    )
-    .expect("metric can be created");
-    REGISTRY
-        .register(Box::new(counter.clone()))
-        .expect("metric can be registered");
-    counter
-});
-
-pub static SOROBAN_TX_FAILED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
-    let counter = IntCounterVec::new(
-        Opts::new(
-            "soroban_tx_failed_total",
-            "Soroban transactions that ended without a confirmed success",
-        ),
-        &["contract", "method", "reason"],
-    )
-    .expect("metric can be created");
-    REGISTRY
-        .register(Box::new(counter.clone()))
-        .expect("metric can be registered");
-    counter
-});
-
-pub static SOROBAN_TX_RETRIES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
-    let counter = IntCounterVec::new(
-        Opts::new(
-            "soroban_tx_retries_total",
-            "Status-poll retries while waiting for a Soroban transaction to confirm",
-        ),
-        &["contract", "method"],
-    )
-    .expect("metric can be created");
-    REGISTRY
-        .register(Box::new(counter.clone()))
-        .expect("metric can be registered");
-    counter
-});
-
-pub static SOROBAN_TX_LATENCY_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
-    let histogram = HistogramVec::new(
-        prometheus::HistogramOpts::new(
-            "soroban_tx_latency_seconds",
-            "End-to-end time from invoke to confirmed success, in seconds",
-        )
-        // Confirmation takes ledgers (~5s each) plus backoff, so the buckets
-        // start where HTTP latency buckets stop.
-        .buckets(vec![0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0]),
-        &["contract", "method"],
-    )
-    .expect("metric can be created");
-    REGISTRY
-        .register(Box::new(histogram.clone()))
-        .expect("metric can be registered");
-    histogram
-});
-
-pub static SOROBAN_DLQ_DEPTH: Lazy<IntGauge> = Lazy::new(|| {
-    let gauge = IntGauge::new(
-        "soroban_dlq_depth",
-        "Entries currently in the Soroban transaction dead-letter queue",
-    )
-    .expect("metric can be created");
+pub static CACHE_HIT_RATE: Lazy<IntGauge> = Lazy::new(|| {
+    let gauge = IntGauge::new("cache_hit_rate", "Profile cache hit rate in percent")
+        .expect("metric can be created");
     REGISTRY
         .register(Box::new(gauge.clone()))
         .expect("metric can be registered");
     gauge
 });
+
+static PROFILE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_CACHE_READS: AtomicU64 = AtomicU64::new(0);
 
 /// Force all lazily-registered metrics to initialize (and therefore
 /// register with the collector registry) at startup, before the first
@@ -222,12 +150,8 @@ pub fn init_metrics() {
     Lazy::force(&CIRCUIT_BREAKER_STATE);
     Lazy::force(&CIRCUIT_BREAKER_REQUESTS_TOTAL);
     Lazy::force(&CIRCUIT_BREAKER_TRIPS_TOTAL);
-    Lazy::force(&SOROBAN_TX_SUBMITTED_TOTAL);
-    Lazy::force(&SOROBAN_TX_SUCCESS_TOTAL);
-    Lazy::force(&SOROBAN_TX_FAILED_TOTAL);
-    Lazy::force(&SOROBAN_TX_RETRIES_TOTAL);
-    Lazy::force(&SOROBAN_TX_LATENCY_SECONDS);
-    Lazy::force(&SOROBAN_DLQ_DEPTH);
+    Lazy::force(&PROFILE_CACHE_REQUESTS_TOTAL);
+    Lazy::force(&CACHE_HIT_RATE);
 
     // Process-level metrics (process_resident_memory_bytes, process_cpu_seconds_total,
     // open fds, ...) — only available on Linux in prometheus crate.
@@ -237,6 +161,23 @@ pub fn init_metrics() {
     )) {
         tracing::warn!(error = %e, "failed to register process metrics collector");
     }
+}
+
+pub fn record_profile_cache_hit() {
+    PROFILE_CACHE_REQUESTS_TOTAL
+        .with_label_values(&["hit"])
+        .inc();
+    PROFILE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+    let reads = PROFILE_CACHE_READS.fetch_add(1, Ordering::Relaxed) + 1;
+    CACHE_HIT_RATE.set((PROFILE_CACHE_HITS.load(Ordering::Relaxed) * 100 / reads) as i64);
+}
+
+pub fn record_profile_cache_miss() {
+    PROFILE_CACHE_REQUESTS_TOTAL
+        .with_label_values(&["miss"])
+        .inc();
+    let reads = PROFILE_CACHE_READS.fetch_add(1, Ordering::Relaxed) + 1;
+    CACHE_HIT_RATE.set((PROFILE_CACHE_HITS.load(Ordering::Relaxed) * 100 / reads) as i64);
 }
 
 /// Snapshot the DB pool's active/idle connection counts into the gauges
