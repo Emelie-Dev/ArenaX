@@ -2,7 +2,9 @@
 #![no_std]
 
 mod flexible_rewards;
+mod lp_incentives;
 mod validator_penalty;
+mod voting_escrow;
 
 use arenax_events::staking as events;
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, Vec};
@@ -13,6 +15,12 @@ use validator_penalty::ValidatorPenaltyManager;
 
 pub use lp_incentives::{LpPerformanceRecord, LpPoolConfig, LpPosition};
 use lp_incentives::{calc_fee_share, calc_il_protection, calc_lp_rewards, dynamic_rate};
+
+pub use voting_escrow::VotingEscrowLock;
+use voting_escrow::{
+    early_unlock_penalty, lock_bonus_bps, voting_weight as calc_voting_weight,
+    MAX_LOCK_DURATION,
+};
 
 // ─── Storage Keys ────────────────────────────────────────────────────────────
 
@@ -50,6 +58,17 @@ pub enum DataKey {
     ValidatorAppeal(BytesN<32>),
     /// Running total of tokens removed from circulation via slash burns.
     BurnedSupply,
+    // LP incentives — these keys were referenced throughout this file
+    // (create_lp_pool, deposit_lp, etc.) but never declared, so the crate
+    // did not compile at all prior to #912. Pre-existing, unrelated to the
+    // voting escrow feature below.
+    LpPoolCounter,
+    LpPool(u32),
+    LpPosition(Address, u32),
+    LpUserPools(Address),
+    LpHistory(Address, u32),
+    // Time-lock voting escrow (#912)
+    VotingEscrowLock(Address),
 }
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -190,6 +209,7 @@ pub struct ValidatorSlashHistory {
     pub validator: Address,
     pub total_slashed: i128,
     pub slash_count: u32,
+    pub slash_ids: Vec<BytesN<32>>,
     /// `Some(slash_id)` when there is an open appeal pending resolution.
     pub active_appeal: Option<BytesN<32>>,
 }
@@ -1032,6 +1052,115 @@ impl StakingManager {
         }
     }
 
+    // ── Time-Lock Voting Escrow (#912) ──────────────────────────────────────────
+    //
+    // A separate facility from the flexible reward pools above: users lock AX
+    // for a duration of their choosing (up to 4 years) in exchange for a
+    // boosted voting weight (10% per full year locked) rather than yield.
+    // Exiting before the chosen unlock time forfeits a flat 25% of principal
+    // to the admin, mirroring where the flexible-pool early-exit penalty goes.
+
+    /// Lock `amount` AX for `duration` seconds (capped at 4 years) and mint a
+    /// voting-escrow position. Panics if the user already has an open lock —
+    /// withdraw it first before opening a new one.
+    pub fn create_voting_lock(env: Env, user: Address, amount: i128, duration: u64) -> i128 {
+        Self::require_not_paused(&env);
+        user.require_auth();
+        if amount <= 0 {
+            panic!("amount must be positive");
+        }
+        if duration == 0 || duration > MAX_LOCK_DURATION {
+            panic!("duration must be between 1 second and 4 years");
+        }
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::VotingEscrowLock(user.clone()))
+        {
+            panic!("existing lock — withdraw it before opening a new one");
+        }
+
+        let ax_token = Self::get_ax_token(env.clone());
+        token::Client::new(&env, &ax_token).transfer(
+            &user,
+            &env.current_contract_address(),
+            &amount,
+        );
+
+        let now = env.ledger().timestamp();
+        let unlock_at = now + duration;
+        let lock = VotingEscrowLock {
+            user: user.clone(),
+            amount,
+            locked_at: now,
+            duration,
+            unlock_at,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::VotingEscrowLock(user.clone()), &lock);
+
+        let weight = calc_voting_weight(amount, duration);
+        events::emit_voting_escrow_locked(&env, &user, amount, duration, unlock_at, weight);
+        weight
+    }
+
+    /// Withdraw a voting-escrow lock. Before `unlock_at` this forfeits 25% of
+    /// principal to the admin; from `unlock_at` onward the full amount is
+    /// returned.
+    pub fn withdraw_voting_lock(env: Env, user: Address) -> i128 {
+        Self::require_not_paused(&env);
+        user.require_auth();
+
+        let key = DataKey::VotingEscrowLock(user.clone());
+        let lock: VotingEscrowLock = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("no voting lock found");
+
+        let now = env.ledger().timestamp();
+        let penalty = early_unlock_penalty(lock.amount, now, lock.unlock_at);
+        let payout = lock.amount - penalty;
+
+        let ax_token = Self::get_ax_token(env.clone());
+        let client = token::Client::new(&env, &ax_token);
+        client.transfer(&env.current_contract_address(), &user, &payout);
+        if penalty > 0 {
+            let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+            client.transfer(&env.current_contract_address(), &admin, &penalty);
+        }
+
+        env.storage().persistent().remove(&key);
+
+        events::emit_voting_escrow_withdrawn(&env, &user, payout, penalty);
+        payout
+    }
+
+    /// This user's current voting-escrow lock, if any — the unlock schedule
+    /// (amount, lock/unlock timestamps, duration) and its live voting weight,
+    /// for dashboard visualization.
+    pub fn get_voting_lock(env: Env, user: Address) -> Option<VotingEscrowLock> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::VotingEscrowLock(user))
+    }
+
+    /// Current voting weight granted by `user`'s lock (0 if none). Weight is
+    /// fixed for the life of the lock — it does not decay as unlock nears.
+    pub fn get_voting_weight(env: Env, user: Address) -> i128 {
+        match Self::get_voting_lock(env, user) {
+            Some(lock) => calc_voting_weight(lock.amount, lock.duration),
+            None => 0,
+        }
+    }
+
+    /// The voting-weight bonus, in basis points, that `duration` would earn —
+    /// useful for a UI to preview the bonus before committing to a lock.
+    pub fn preview_lock_bonus_bps(_env: Env, duration: u64) -> u32 {
+        lock_bonus_bps(duration.min(MAX_LOCK_DURATION))
+    }
+
     // ── Validator Penalty / Slashing ─────────────────────────────────────────
 
     /// Configure the validator slash system. Admin-only.
@@ -1069,6 +1198,16 @@ impl StakingManager {
     /// Return the slash history for a validator, or `None` if never slashed.
     pub fn get_slash_history(env: Env, validator: Address) -> Option<ValidatorSlashHistory> {
         ValidatorPenaltyManager::get_slash_history(&env, validator)
+    }
+
+    /// Return slash records for a validator in slash-id order, paginated.
+    pub fn get_slash_records_paginated(
+        env: Env,
+        validator: Address,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<SlashRecord> {
+        ValidatorPenaltyManager::get_slash_records_paginated(&env, validator, offset, limit)
     }
 
     /// Return the `SlashRecord` for a given `slash_id`, or `None` if not found.

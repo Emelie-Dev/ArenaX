@@ -1,8 +1,10 @@
 use crate::api_error::ApiError;
 use crate::auth::middleware::ClaimsExt;
+use crate::db::DbPool;
 use crate::middleware::security::validate_uuid;
+use crate::middleware::tenant_context::{with_tenant_scope, TenantContext};
 use crate::models::{
-    CreateTournamentRequest, JoinTournamentRequest, PaginatedResponse,
+    CreateTournamentRequest, JoinTournamentRequest, PaginatedResponse, TournamentParticipant,
     TournamentStatus,
 };
 use crate::service::tournament_service::TournamentService;
@@ -138,6 +140,38 @@ pub async fn get_tournament(
     let tournament = svc.get_tournament(tournament_id, user_id).await?;
 
     Ok(HttpResponse::Ok().json(tournament))
+}
+
+/// GET /api/tournaments/{id}/participants
+///
+/// Row-level-security-scoped (#1108): runs on a connection with
+/// `app.tournament_id` set to this route's `{id}`, so even a bug in the
+/// query below couldn't leak another tournament's participants — the
+/// database itself won't return rows outside this tenant.
+pub async fn get_tournament_participants(
+    req: HttpRequest,
+    pool: web::Data<DbPool>,
+    path: web::Path<Uuid>,
+) -> Result<HttpResponse, ApiError> {
+    let tournament_id = path.into_inner();
+    let ctx = req
+        .extensions()
+        .get::<TenantContext>()
+        .cloned()
+        .unwrap_or_default();
+
+    let participants = with_tenant_scope(pool.get_ref(), &ctx, move |mut conn| async move {
+        sqlx::query_as::<_, TournamentParticipant>(
+            "SELECT * FROM tournament_participants WHERE tournament_id = $1 ORDER BY registered_at",
+        )
+        .bind(tournament_id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(ApiError::DatabaseError)
+    })
+    .await?;
+
+    Ok(HttpResponse::Ok().json(participants))
 }
 
 /// POST /api/tournaments/{id}/register
@@ -315,6 +349,7 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
             .route("", web::get().to(list_tournaments))
             .route("/{id}", web::get().to(get_tournament))
             .route("/{id}", web::delete().to(cancel_tournament))
+            .route("/{id}/participants", web::get().to(get_tournament_participants))
             .route("/{id}/register", web::post().to(register_for_tournament))
             .route("/{id}/start", web::post().to(start_tournament))
             .route("/{id}/advance", web::post().to(advance_bracket))

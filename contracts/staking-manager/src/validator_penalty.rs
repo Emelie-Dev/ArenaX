@@ -12,7 +12,7 @@ use crate::{
 };
 use arenax_events::slashing as slash_events;
 use arenax_events::staking as stake_events;
-use soroban_sdk::{Address, Bytes, BytesN, Env};
+use soroban_sdk::{Address, Bytes, BytesN, Env, Vec};
 
 /// Provides all validator penalty operations. Methods are static helpers
 /// called from the `StakingManager` contract-impl block in `lib.rs`.
@@ -168,10 +168,12 @@ impl ValidatorPenaltyManager {
                 validator: validator.clone(),
                 total_slashed: 0,
                 slash_count: 0,
+                slash_ids: Vec::new(env),
                 active_appeal: None,
             });
         history.total_slashed += actual_amount;
         history.slash_count += 1;
+        history.slash_ids.push_back(slash_id.clone());
         env.storage()
             .persistent()
             .set(&DataKey::ValidatorSlashRecord(validator.clone()), &history);
@@ -386,6 +388,54 @@ impl ValidatorPenaltyManager {
             .get(&DataKey::ValidatorSlashRecord(validator))
     }
 
+    /// Return slash records for a validator in slash-id order, paginated.
+    pub fn get_slash_records_paginated(
+        env: &Env,
+        validator: Address,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<SlashRecord> {
+        let history: ValidatorSlashHistory = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ValidatorSlashRecord(validator.clone()))
+            .unwrap_or(ValidatorSlashHistory {
+                validator,
+                total_slashed: 0,
+                slash_count: 0,
+                slash_ids: Vec::new(env),
+                active_appeal: None,
+            });
+
+        let max_limit = 50u32;
+        let page_limit = limit.min(max_limit);
+        if page_limit == 0 {
+            return Vec::new(env);
+        }
+
+        let total = history.slash_ids.len() as usize;
+        let start = offset as usize;
+        if start >= total {
+            return Vec::new(env);
+        }
+
+        let end = (start + page_limit as usize).min(total);
+        let mut records = Vec::new(env);
+        for index in start..end {
+            let slash_id = history
+                .slash_ids
+                .get(index as u32)
+                .expect("slash id missing from validator history");
+            let record: SlashRecord = env
+                .storage()
+                .persistent()
+                .get(&DataKey::ValidatorAppealRecord(slash_id))
+                .expect("slash record not found");
+            records.push_back(record);
+        }
+        records
+    }
+
     /// Return the `SlashRecord` for a given `slash_id`, or `None`.
     pub fn get_slash_record(env: &Env, slash_id: BytesN<32>) -> Option<SlashRecord> {
         env.storage()
@@ -406,6 +456,6 @@ impl ValidatorPenaltyManager {
         for b in be.iter() {
             raw.push_back(*b);
         }
-        env.crypto().sha256(&raw)
+        env.crypto().sha256(&raw).into()
     }
 }
