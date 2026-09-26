@@ -277,10 +277,19 @@ impl SorobanService {
             "Invoking Soroban contract function"
         );
 
+        // Prometheus (#1070): every invocation counts as one submission and
+        // ends in exactly one of success (with latency) or failed{reason}.
+        crate::metrics::record_soroban_submitted(contract_id, function_name);
+        let started = std::time::Instant::now();
+        let fail = |reason: &str| {
+            crate::metrics::record_soroban_failed(contract_id, function_name, reason)
+        };
+
         // Step 1: Simulate the transaction
         let simulate_result = self
             .simulate_transaction(contract_id, function_name, args, signer_secret)
-            .await?;
+            .await
+            .inspect_err(|_| fail("simulation"))?;
 
         // Step 2: Build and sign the transaction
         let signed_tx = self
@@ -292,23 +301,44 @@ impl SorobanService {
                 &simulate_result.transaction_data,
                 &simulate_result.min_resource_fee,
             )
-            .await?;
+            .await
+            .inspect_err(|_| fail("build"))?;
 
         // Step 3: Submit the transaction
-        let tx_hash = self.send_transaction(&signed_tx).await?;
+        let tx_hash = self
+            .send_transaction(&signed_tx)
+            .await
+            .inspect_err(|_| fail("submission"))?;
 
         // Step 4: Monitor the transaction
-        let result = self
-            .monitor_transaction(&tx_hash)
+        let result = match self
+            .monitor_transaction(&tx_hash, contract_id, function_name)
             .await
-            .unwrap_or_else(|e| {
+        {
+            Ok(result) => {
+                match result.status {
+                    TxStatus::Success => crate::metrics::record_soroban_success(
+                        contract_id,
+                        function_name,
+                        started.elapsed().as_secs_f64(),
+                    ),
+                    TxStatus::Failed => fail("on_chain"),
+                    // Still pending after every retry: the service gave up
+                    // waiting, so this is a final outcome for the caller.
+                    TxStatus::Pending => fail("unconfirmed"),
+                }
+                result
+            }
+            Err(e) => {
                 warn!(tx_hash = tx_hash, error = %e, "Failed to monitor transaction");
+                fail("monitor_error");
                 SorobanTxResult {
                     hash: tx_hash.clone(),
                     status: TxStatus::Pending,
                     error: Some(format!("Monitoring failed: {}", e)),
                 }
-            });
+            }
+        };
 
         Ok(result)
     }
@@ -443,7 +473,12 @@ impl SorobanService {
     }
 
     /// Monitor a transaction until it completes or fails
-    async fn monitor_transaction(&self, tx_hash: &str) -> Result<SorobanTxResult, SorobanError> {
+    async fn monitor_transaction(
+        &self,
+        tx_hash: &str,
+        contract_id: &str,
+        function_name: &str,
+    ) -> Result<SorobanTxResult, SorobanError> {
         let mut attempt = 0;
         let mut delay = self.retry_config.initial_delay_ms;
 
@@ -503,6 +538,7 @@ impl SorobanService {
             }
 
             attempt += 1;
+            crate::metrics::record_soroban_retry(contract_id, function_name);
             debug!(
                 tx_hash = tx_hash,
                 attempt = attempt,
