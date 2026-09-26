@@ -57,6 +57,7 @@ export function AppLayout({ children }: AppLayoutProps) {
 
   return (
     <SessionTimeoutProvider>
+      <NotificationBadgeEffect />
       <div className="min-h-screen bg-background font-sans antialiased flex flex-col">
         <OfflineBanner />
         <SkipLink targetId="main-content" />
