@@ -57,6 +57,7 @@ export function AppLayout({ children }: AppLayoutProps) {
 
   return (
     <SessionTimeoutProvider>
+      <NotificationBadgeEffect />
       <div className="min-h-screen bg-background font-sans antialiased flex flex-col">
         <OfflineBanner />
         <SkipLink targetId="main-content" />
@@ -123,8 +124,9 @@ export function AppLayout({ children }: AppLayoutProps) {
         </div>
       </footer>
       
-      {/* Session timeout warning modal - to be integrated by consumer */}
-      
+      {/* JWT-expiry countdown warning — 2 min before the access token expires (#1090) */}
+      <SessionExpiryWarningModal />
+
       </div>
     </SessionTimeoutProvider>
   );

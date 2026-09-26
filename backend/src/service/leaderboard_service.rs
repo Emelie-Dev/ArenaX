@@ -3,17 +3,59 @@ use crate::models::{
     LeaderboardEntry, LeaderboardResponse, PlayerRankResponse, RankHistory, RankHistoryEntry,
     SeasonalLeaderboard, LeaderboardStats,
 };
+use crate::middleware::cache::{keys as cache_keys, policies as cache_policies, ResponseCache};
+use crate::realtime::leaderboard_broadcaster::{LeaderboardBroadcaster, RankObservation};
 use chrono::{DateTime, Utc, Duration};
 use sqlx::PgPool;
+use std::sync::Arc;
 use uuid::Uuid;
 
 pub struct LeaderboardService {
     db_pool: PgPool,
+    /// Pushes rank changes to subscribed clients (Issue #900).
+    ///
+    /// Optional so the service stays constructible without the realtime stack —
+    /// migrations, batch jobs and tests have no WebSocket clients to notify,
+    /// and rank updates must not depend on Redis being reachable.
+    broadcaster: Option<Arc<LeaderboardBroadcaster>>,
+    /// Response cache for the read path (Issue #910).
+    ///
+    /// Optional for the same reason as `broadcaster`: the service must stay
+    /// usable without Redis, and a cache that is absent simply means every
+    /// read goes to Postgres, which is the behaviour this replaced.
+    cache: Option<ResponseCache>,
 }
 
 impl LeaderboardService {
     pub fn new(db_pool: PgPool) -> Self {
-        Self { db_pool }
+        Self {
+            db_pool,
+            broadcaster: None,
+            cache: None,
+        }
+    }
+
+    /// Attaches the response cache to the leaderboard read path.
+    pub fn with_cache(mut self, cache: ResponseCache) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    /// Attaches a broadcaster so rank updates are pushed in real time.
+    pub fn with_broadcaster(mut self, broadcaster: Arc<LeaderboardBroadcaster>) -> Self {
+        self.broadcaster = Some(broadcaster);
+        self
+    }
+
+    /// Publishes a rank change, if a broadcaster is attached.
+    ///
+    /// Deliberately infallible: a client that misses a push re-syncs from the
+    /// REST board, so a broadcast failure must never fail the rank update that
+    /// has already been committed.
+    async fn broadcast_rank(&self, category: &str, observation: RankObservation) {
+        if let Some(broadcaster) = &self.broadcaster {
+            broadcaster.publish_changes(category, &[observation]).await;
+        }
     }
 
     /// Get leaderboard rankings for a category (optimized with single query)
@@ -23,25 +65,32 @@ impl LeaderboardService {
         limit: i64,
         offset: i64,
     ) -> Result<LeaderboardResponse, ApiError> {
-        // Optimized: use window function to get count in same query
-        let entries = sqlx::query_as::<_, (Uuid, Uuid, String, Option<String>, i32, i32, i32, i32, i32, f64, String, DateTime<Utc>, i64)>(
-            r#"
-            SELECT 
-                l.id, l.user_id, u.username, u.avatar_url,
-                l.ranking, l.elo_rating, l.matches_played, l.wins, l.losses, l.win_rate,
-                l.period, l.updated_at,
-                COUNT(*) OVER() as total_count
-            FROM leaderboards l
-            INNER JOIN users u ON l.user_id = u.id
-            WHERE l.game = $1 AND l.period = 'all_time'
-            ORDER BY l.ranking ASC
-            LIMIT $2 OFFSET $3
-            "#
+        // Optimized: use window function to get count in same query.
+        // Wrapped in `time_query` (#1084) — this endpoint is hit on every
+        // leaderboard page load, so it's exactly the kind of query a
+        // `db_query_duration_seconds{query_name="leaderboard.get_leaderboard"}`
+        // P99 alert should watch.
+        let entries = crate::metrics::time_query(
+            "leaderboard.get_leaderboard",
+            sqlx::query_as::<_, (Uuid, Uuid, String, Option<String>, i32, i32, i32, i32, i32, f64, String, DateTime<Utc>, i64)>(
+                r#"
+                SELECT
+                    l.id, l.user_id, u.username, u.avatar_url,
+                    l.ranking, l.elo_rating, l.matches_played, l.wins, l.losses, l.win_rate,
+                    l.period, l.updated_at,
+                    COUNT(*) OVER() as total_count
+                FROM leaderboards l
+                INNER JOIN users u ON l.user_id = u.id
+                WHERE l.game = $1 AND l.period = 'all_time'
+                ORDER BY l.ranking ASC
+                LIMIT $2 OFFSET $3
+                "#
+            )
+            .bind(category)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.db_pool),
         )
-        .bind(category)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.db_pool)
         .await
         .map_err(|e| ApiError::DatabaseError(e))?;
 
@@ -67,12 +116,28 @@ impl LeaderboardService {
             })
             .collect();
 
-        Ok(LeaderboardResponse {
+        let response = LeaderboardResponse {
             entries: leaderboard_entries,
             total_count,
             period: "all_time".to_string(),
             category: category.to_string(),
-        })
+        };
+
+        if let Some(cache) = &self.cache {
+            // Tagged by category so a single rank change drops every cached
+            // page of that board at once, rather than leaving page 3 stale
+            // while page 1 refreshes.
+            cache
+                .set(
+                    &cache_keys::leaderboard(category, limit, offset),
+                    &response,
+                    cache_policies::LEADERBOARD,
+                    &[cache_keys::leaderboard_tag(category)],
+                )
+                .await;
+        }
+
+        Ok(response)
     }
 
     /// Get seasonal leaderboard rankings (optimized with single query)
@@ -321,6 +386,28 @@ impl LeaderboardService {
         .await
         .map_err(|e| ApiError::DatabaseError(e))?;
 
+        // The board just changed, so every cached page of it is wrong.
+        if let Some(cache) = &self.cache {
+            cache
+                .invalidate_tags(&[
+                    cache_keys::leaderboard_tag(category),
+                    cache_keys::player_tag(&player_id),
+                ])
+                .await;
+        }
+
+        // Push the change to subscribed clients. The tracker drops it if the
+        // rank did not actually move, so calling this unconditionally is free.
+        self.broadcast_rank(
+            category,
+            RankObservation {
+                user_id: player_id,
+                ranking: new_ranking,
+                elo_rating,
+            },
+        )
+        .await;
+
         Ok(())
     }
 
@@ -348,6 +435,13 @@ impl LeaderboardService {
             for task in tasks {
                 task.await?;
             }
+        }
+
+        // A refresh is exactly the burst the per-player throttle holds back, so
+        // flush once at the end rather than leaving the last change for each
+        // player sitting until some unrelated update arrives.
+        if let Some(broadcaster) = &self.broadcaster {
+            broadcaster.flush(category).await;
         }
 
         Ok(())
