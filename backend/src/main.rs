@@ -33,6 +33,7 @@ use crate::middleware::tenant_context::TenantContextMiddleware;
 use crate::middleware::tracing_middleware::RequestTracing;
 use crate::models::idempotency::IdempotencyPolicy;
 use crate::service::batch_service::BatchService;
+use crate::service::evidence_storage::{EvidenceStore, S3EvidenceStore};
 use crate::service::match_authority_service::MatchAuthorityService;
 use crate::service::ReaperService;
 use crate::realtime::event_bus::EventBus;
@@ -247,6 +248,9 @@ async fn main() -> io::Result<()> {
 
     // Snapshot the rate limit config so it can be moved into the HttpServer closure.
     let rate_limit_config = config.rate_limit.clone();
+
+    // Tamper-evident dispute evidence storage (#1081, #1076).
+    let evidence_store: Arc<dyn EvidenceStore> = Arc::new(S3EvidenceStore::new(&config.storage));
 
     let server = HttpServer::new(move || {
         App::new()
