@@ -170,7 +170,7 @@ impl Config {
         let stellar_network_url = env::var("STELLAR_NETWORK_URL")?;
         let stellar_admin_secret = env::var("STELLAR_ADMIN_SECRET")?;
         let soroban_contract_prize = env::var("SOROBAN_CONTRACT_PRIZE")?;
-        let soroban_contract_reputation = env::var("SOROBAN_CONTRACT_REPUUTATION")?;
+        let soroban_contract_reputation = env::var("SOROBAN_CONTRACT_REPUTATION")?;
         let soroban_contract_arenax_token = env::var("SOROBAN_CONTRACT_ARENAX_TOKEN")?;
         // Falls back to the prize contract so existing deployments don't break.
         let soroban_contract_match = env::var("SOROBAN_CONTRACT_MATCH")

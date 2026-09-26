@@ -10,6 +10,7 @@ use once_cell::sync::Lazy;
 use prometheus::{
     Encoder, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
 
@@ -113,6 +114,30 @@ pub static CIRCUIT_BREAKER_TRIPS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     counter
 });
 
+pub static PROFILE_CACHE_REQUESTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new("profile_cache_requests_total", "Profile cache reads by outcome"),
+        &["outcome"],
+    )
+    .expect("metric can be created");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("metric can be registered");
+    counter
+});
+
+pub static CACHE_HIT_RATE: Lazy<IntGauge> = Lazy::new(|| {
+    let gauge = IntGauge::new("cache_hit_rate", "Profile cache hit rate in percent")
+        .expect("metric can be created");
+    REGISTRY
+        .register(Box::new(gauge.clone()))
+        .expect("metric can be registered");
+    gauge
+});
+
+static PROFILE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_CACHE_READS: AtomicU64 = AtomicU64::new(0);
+
 /// Force all lazily-registered metrics to initialize (and therefore
 /// register with the collector registry) at startup, before the first
 /// scrape — otherwise a metric with no observations yet simply wouldn't
@@ -125,6 +150,8 @@ pub fn init_metrics() {
     Lazy::force(&CIRCUIT_BREAKER_STATE);
     Lazy::force(&CIRCUIT_BREAKER_REQUESTS_TOTAL);
     Lazy::force(&CIRCUIT_BREAKER_TRIPS_TOTAL);
+    Lazy::force(&PROFILE_CACHE_REQUESTS_TOTAL);
+    Lazy::force(&CACHE_HIT_RATE);
 
     // Process-level metrics (process_resident_memory_bytes, process_cpu_seconds_total,
     // open fds, ...) — only available on Linux in prometheus crate.
@@ -134,6 +161,23 @@ pub fn init_metrics() {
     )) {
         tracing::warn!(error = %e, "failed to register process metrics collector");
     }
+}
+
+pub fn record_profile_cache_hit() {
+    PROFILE_CACHE_REQUESTS_TOTAL
+        .with_label_values(&["hit"])
+        .inc();
+    PROFILE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+    let reads = PROFILE_CACHE_READS.fetch_add(1, Ordering::Relaxed) + 1;
+    CACHE_HIT_RATE.set((PROFILE_CACHE_HITS.load(Ordering::Relaxed) * 100 / reads) as i64);
+}
+
+pub fn record_profile_cache_miss() {
+    PROFILE_CACHE_REQUESTS_TOTAL
+        .with_label_values(&["miss"])
+        .inc();
+    let reads = PROFILE_CACHE_READS.fetch_add(1, Ordering::Relaxed) + 1;
+    CACHE_HIT_RATE.set((PROFILE_CACHE_HITS.load(Ordering::Relaxed) * 100 / reads) as i64);
 }
 
 /// Snapshot the DB pool's active/idle connection counts into the gauges
@@ -162,6 +206,49 @@ pub fn record_circuit_breaker_trip(service: &str) {
     CIRCUIT_BREAKER_TRIPS_TOTAL
         .with_label_values(&[service])
         .inc();
+}
+
+/// A Soroban contract invocation was attempted.
+pub fn record_soroban_submitted(contract: &str, method: &str) {
+    SOROBAN_TX_SUBMITTED_TOTAL
+        .with_label_values(&[contract, method])
+        .inc();
+}
+
+/// A Soroban transaction was confirmed successful, `elapsed_secs` after the
+/// invocation started.
+pub fn record_soroban_success(contract: &str, method: &str, elapsed_secs: f64) {
+    SOROBAN_TX_SUCCESS_TOTAL
+        .with_label_values(&[contract, method])
+        .inc();
+    SOROBAN_TX_LATENCY_SECONDS
+        .with_label_values(&[contract, method])
+        .observe(elapsed_secs);
+}
+
+/// A Soroban invocation ended without a confirmed success. `reason` is one of
+/// a fixed set of values chosen in `SorobanService::invoke`.
+pub fn record_soroban_failed(contract: &str, method: &str, reason: &str) {
+    SOROBAN_TX_FAILED_TOTAL
+        .with_label_values(&[contract, method, reason])
+        .inc();
+}
+
+/// One more status poll was needed before the transaction settled.
+pub fn record_soroban_retry(contract: &str, method: &str) {
+    SOROBAN_TX_RETRIES_TOTAL
+        .with_label_values(&[contract, method])
+        .inc();
+}
+
+/// Set the current dead-letter queue depth.
+///
+/// Nothing calls this yet: the backend has no Soroban DLQ table (the handler
+/// module declared for it by #864 was never added). Whatever stores
+/// dead-lettered transactions should call this with its row count so
+/// `soroban_dlq_depth` and the `SorobanDlqBacklog` alert reflect it.
+pub fn set_soroban_dlq_depth(depth: i64) {
+    SOROBAN_DLQ_DEPTH.set(depth);
 }
 
 pub async fn metrics_handler() -> Result<HttpResponse> {

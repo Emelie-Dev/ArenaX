@@ -315,10 +315,19 @@ impl SorobanService {
             "Invoking Soroban contract function"
         );
 
+        // Prometheus (#1070): every invocation counts as one submission and
+        // ends in exactly one of success (with latency) or failed{reason}.
+        crate::metrics::record_soroban_submitted(contract_id, function_name);
+        let started = std::time::Instant::now();
+        let fail = |reason: &str| {
+            crate::metrics::record_soroban_failed(contract_id, function_name, reason)
+        };
+
         // Step 1: Simulate the transaction
         let simulate_result = self
             .simulate_transaction(contract_id, function_name, args, signer_secret)
-            .await?;
+            .await
+            .inspect_err(|_| fail("simulation"))?;
 
         // Step 2: Build and sign the transaction
         let signed_tx = self
@@ -330,7 +339,8 @@ impl SorobanService {
                 &simulate_result.transaction_data,
                 &simulate_result.min_resource_fee,
             )
-            .await?;
+            .await
+            .inspect_err(|_| fail("build"))?;
 
         // Step 3: Submit the transaction
         let tx_hash = self.send_transaction(&signed_tx).await?;
@@ -343,12 +353,14 @@ impl SorobanService {
             .unwrap_or_else(|e| {
                 log_soroban_event(SorobanEventStatus::Dlq, &tx_hash, contract_id, function_name);
                 warn!(tx_hash = tx_hash, error = %e, "Failed to monitor transaction");
+                fail("monitor_error");
                 SorobanTxResult {
                     hash: tx_hash.clone(),
                     status: TxStatus::Pending,
                     error: Some(format!("Monitoring failed: {}", e)),
                 }
-            });
+            }
+        };
 
         Ok(result)
     }
