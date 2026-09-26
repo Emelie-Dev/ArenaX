@@ -58,6 +58,9 @@ const nextConfig = {
     loaderFile: "./src/lib/imageLoader.ts",
   },
   compress: true,
+  // Generate client source maps so production errors have readable stacks and
+  // can be uploaded to Datadog (Issue #1100). The upload runs as `postbuild`.
+  productionBrowserSourceMaps: true,
   experimental: {
     optimizePackageImports: ["lucide-react", "framer-motion", "recharts", "@tanstack/react-query"],
   },
