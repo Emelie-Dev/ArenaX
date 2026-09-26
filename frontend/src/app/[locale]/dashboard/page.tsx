@@ -12,6 +12,7 @@ import { RecentGames } from "@/components/dashboard/RecentGames";
 import { AchievementProgress } from "@/components/dashboard/AchievementProgress";
 import { FriendsList } from "@/components/dashboard/FriendsList";
 import { QuickPlay } from "@/components/dashboard/QuickPlay";
+import { LoginStreak } from "@/components/dashboard/LoginStreak";
 import { LeaderboardPreview } from "@/components/dashboard/LeaderboardPreview";
 import { NewsFeed } from "@/components/dashboard/NewsFeed";
 import { RouteGuard } from "@/components/navigation/RouteGuard";
@@ -139,12 +140,12 @@ export default function DashboardPage() {
             </div>
           </div>
 
-          {/* Right sidebar — 1/3 width */}
-          <div className="space-y-6">
-            <QuickPlay />
-            <FriendsList compact />
-            <LeaderboardPreview />
-          </div>
+        {/* Right sidebar — 1/3 width */}
+        <div className="space-y-6">
+          <LoginStreak />
+          <QuickPlay />
+          <FriendsList compact />
+          <LeaderboardPreview />
         </div>
       </div>
     </div>

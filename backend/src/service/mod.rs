@@ -3,6 +3,7 @@ pub mod achievement_service;
 pub mod email_service;
 pub mod suspension_service;
 pub mod analytics_service;
+pub mod audit_service;
 pub mod feature_flags;
 pub mod auth_service;
 pub mod governance_service;
@@ -31,14 +32,7 @@ pub use governance_service::{
     ProposalStatus as GovProposalStatus,
 };
 pub use achievement_service::AchievementService;
-pub use email_service::{
-    DigestEntry, EmailCategory, EmailMessage, EmailPreference, EmailService, EmailTransport,
-    HttpTransport, LoggingTransport, SendOutcome,
-};
-pub use suspension_service::{
-    AppealStatus, RestrictionCheck, RestrictionScope, Suspension, SuspensionKind,
-    SuspensionService,
-};
+pub use audit_service::{AuditAction, AuditEntryInput, AuditFilter, AuditService};
 pub use feature_flags::FeatureFlagService;
 pub use idempotency_service::IdempotencyService;
 pub use leaderboard_service::LeaderboardService;
