@@ -25,7 +25,8 @@ impl NFTManager {
             return Err(VirtualEconomyError::InvalidMetadata);
         }
 
-        if metadata.royalty_bps > 2000 {
+        // Creator royalties are configurable 0-10% (#913).
+        if metadata.royalty_bps > 1000 {
             return Err(VirtualEconomyError::RoyaltyTooHigh);
         }
 

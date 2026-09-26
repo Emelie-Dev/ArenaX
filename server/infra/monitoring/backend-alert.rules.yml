@@ -62,3 +62,13 @@ groups:
         annotations:
           summary: "arenax-backend resident memory above 1.5GB"
           description: "Process RSS has been above 1.5GB for 10 minutes — check for leaks or scale up."
+
+      - alert: SorobanDlqBacklog
+        expr: soroban_dlq_depth{job="arenax-backend"} > 10
+        for: 5m
+        labels:
+          severity: critical
+          service: arenax-backend
+        annotations:
+          summary: "arenax-backend Soroban dead-letter queue above 10 entries"
+          description: "More than 10 Soroban transactions have been in the dead-letter queue for 5 minutes. On-chain actions (payouts, match results) are not landing; inspect the DLQ and retry or resolve them."

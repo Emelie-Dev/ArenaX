@@ -406,6 +406,6 @@ impl ValidatorPenaltyManager {
         for b in be.iter() {
             raw.push_back(*b);
         }
-        env.crypto().sha256(&raw)
+        env.crypto().sha256(&raw).into()
     }
 }
