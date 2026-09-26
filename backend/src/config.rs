@@ -13,6 +13,7 @@ pub struct Config {
     pub server: ServerConfig,
     pub rate_limit: RateLimitConfig,
     pub idempotency: IdempotencyConfig,
+    pub notifications: NotificationsConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -144,6 +145,16 @@ pub struct IdempotencyConfig {
     pub max_response_size_kb: u32,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct NotificationsConfig {
+    /// SendGrid API key for the email fan-out channel (#1107). Empty when
+    /// unset — the email channel then fails fast rather than silently
+    /// no-op'ing, so a misconfigured deployment is visible in the delivery
+    /// audit log instead of just losing emails quietly.
+    pub sendgrid_api_key: String,
+    pub sendgrid_from_email: String,
+}
+
 impl Config {
     pub fn from_env() -> Result<Self, anyhow::Error> {
         dotenvy::dotenv().ok();
@@ -166,7 +177,7 @@ impl Config {
         let stellar_network_url = env::var("STELLAR_NETWORK_URL")?;
         let stellar_admin_secret = env::var("STELLAR_ADMIN_SECRET")?;
         let soroban_contract_prize = env::var("SOROBAN_CONTRACT_PRIZE")?;
-        let soroban_contract_reputation = env::var("SOROBAN_CONTRACT_REPUUTATION")?;
+        let soroban_contract_reputation = env::var("SOROBAN_CONTRACT_REPUTATION")?;
         let soroban_contract_arenax_token = env::var("SOROBAN_CONTRACT_ARENAX_TOKEN")?;
         // Falls back to the prize contract so existing deployments don't break.
         let soroban_contract_match = env::var("SOROBAN_CONTRACT_MATCH")
@@ -186,6 +197,9 @@ impl Config {
         let idempotency_max_response_size_kb: u32 = env::var("IDEMPOTENCY_MAX_RESPONSE_SIZE_KB")
             .unwrap_or_else(|_| "1024".to_string())
             .parse()?;
+        let sendgrid_api_key = env::var("SENDGRID_API_KEY").unwrap_or_default();
+        let sendgrid_from_email =
+            env::var("SENDGRID_FROM_EMAIL").unwrap_or_else(|_| "no-reply@arenax.gg".to_string());
 
         Ok(Config {
             database: DatabaseConfig {
@@ -239,6 +253,10 @@ impl Config {
             idempotency: IdempotencyConfig {
                 ttl_seconds: idempotency_ttl_seconds,
                 max_response_size_kb: idempotency_max_response_size_kb,
+            },
+            notifications: NotificationsConfig {
+                sendgrid_api_key,
+                sendgrid_from_email,
             },
         })
     }

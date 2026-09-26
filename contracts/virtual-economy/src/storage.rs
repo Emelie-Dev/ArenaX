@@ -89,6 +89,25 @@ pub enum DataKey {
     // Referral
     ReferralConfig,
     ReferralAccount(Address),
+
+    // NFT Collections (#913) — keyed by collection name, matched against
+    // NFTMetadata.category at mint time.
+    Collection(String),
+
+    // Trading Rebates (#916)
+    /// Tiered rebate configuration (thresholds + bps, distribution period).
+    RebateConfig,
+    /// Trading volume accumulated by an address since the last monthly
+    /// rebate run. Reset to zero once that volume has been rebated.
+    TraderVolume(Address),
+    /// Addresses with a nonzero `TraderVolume`, so a monthly run can find
+    /// everyone owed a rebate without an off-chain indexer.
+    TrackedTraders,
+    /// Ledger timestamp of the last completed monthly rebate distribution.
+    LastRebateRun,
+    /// Rebate payout history for an address (most recent last), for
+    /// dashboard visibility.
+    RebateHistory(Address),
 }
 
 #[contracttype]
@@ -118,7 +137,7 @@ pub struct NFTMetadata {
     pub rarity: u32, // 1-5 scale
     pub category: String,
     pub creator: Address,
-    pub royalty_bps: u32, // basis points, max 2000 (20%)
+    pub royalty_bps: u32, // basis points, configurable 0-1000 (0-10%, #913)
 }
 
 #[contracttype]
@@ -127,6 +146,22 @@ pub struct NFTAttribute {
     pub trait_type: String,
     pub value: String,
     pub display_type: Option<String>,
+}
+
+/// A named grouping of NFTs (#913) — an NFT joins a collection when its
+/// `NFTMetadata.category` matches `NFTCollection.name`. Collections are
+/// opt-in: minting with an unregistered category still succeeds, it just
+/// isn't counted toward any collection's `item_count`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NFTCollection {
+    pub name: String,
+    pub creator: Address,
+    /// Applied to new mints in this collection that don't specify their own
+    /// `royalty_bps` override — informational default, not auto-applied,
+    /// since `mint_nft` takes a fully-formed `NFTMetadata`.
+    pub default_royalty_bps: u32,
+    pub item_count: u32,
 }
 
 #[contracttype]
@@ -457,4 +492,30 @@ pub struct NftStakingAnalytics {
     pub total_rewards_distributed: i128,
     /// Total number of unique stakers (monotonically increasing).
     pub unique_stakers: u32,
+}
+
+/// Tiered trading-rebate configuration (#916). Tiers are evaluated against a
+/// trader's accumulated volume since the last monthly run; the highest tier
+/// whose threshold is met wins.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RebateConfig {
+    pub tier1_min_volume: i128,
+    pub tier2_min_volume: i128,
+    pub tier3_min_volume: i128,
+    pub tier1_bps: u32, // 100 = 1%
+    pub tier2_bps: u32, // 200 = 2%
+    pub tier3_bps: u32, // 500 = 5%
+    /// Minimum time (seconds) that must elapse between monthly runs.
+    pub period_seconds: u64,
+}
+
+/// A single historical rebate payout, for dashboard visibility (#916).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RebatePayout {
+    pub volume: i128,
+    pub bps: u32,
+    pub amount: i128,
+    pub paid_at: u64,
 }

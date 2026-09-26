@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { BracketMatchStatus, ScoreReport } from "@/types/bracket";
 
 // ---------------------------------------------------------------------------
@@ -258,6 +259,16 @@ interface ScoreSubmission {
 
 interface UseMatchScoreReportingOptions {
   expectedReport?: ScoreReport | null;
+  /** Keys the "pending report" cache entry (#1088). Falls back to a shared key when omitted. */
+  matchId?: string;
+}
+
+/** Thrown by the mutation when the reporter's score doesn't match the opponent's (#1088). */
+class ScoreConflictError extends Error {
+  constructor(public readonly expectedReport: ScoreReport) {
+    super("SCORE_CONFLICT");
+    this.name = "ScoreConflictError";
+  }
 }
 
 interface UseMatchScoreReportingReturn {
@@ -272,28 +283,28 @@ interface UseMatchScoreReportingReturn {
 export function useMatchScoreReporting(
   options: UseMatchScoreReportingOptions = {},
 ): UseMatchScoreReportingReturn {
-  const [isReporting, setIsReporting] = useState(false);
-  const [pendingReport, setPendingReport] = useState<ScoreReport | null>(null);
+  const queryClient = useQueryClient();
   const [conflictDetected, setConflictDetected] = useState(false);
   const [conflictingReport, setConflictingReport] = useState<ScoreReport | null>(
     null,
   );
 
-  const reportScore = useCallback(
-    async (report: ScoreSubmission): Promise<boolean> => {
-      setIsReporting(true);
+  const pendingKey = ["pendingScoreReport", options.matchId ?? "unknown"] as const;
 
-      const submittedReport: ScoreReport = {
-        reporterId: report.reporterId,
-        reporterName: report.reporterName ?? "You",
-        player1Score: report.player1Score,
-        player2Score: report.player2Score,
-        submittedAt: new Date().toISOString(),
-      };
+  // Cache-only value: never fetched, only ever written by the mutation's
+  // onMutate below — this is what makes the "Pending Confirmation" state
+  // (#1088) visible the instant the user submits, not after the round trip.
+  const { data: pendingReport = null } = useQuery({
+    queryKey: pendingKey,
+    queryFn: () => null as ScoreReport | null,
+    staleTime: Infinity,
+    enabled: false,
+  });
 
-      setPendingReport(submittedReport);
-
-      // Small debounce to avoid double-submissions on fast taps.
+  const mutation = useMutation({
+    mutationFn: async (report: ScoreSubmission) => {
+      // Small debounce to avoid double-submissions on fast taps, and to
+      // simulate the server round trip that resolves the report.
       await new Promise((resolve) => setTimeout(resolve, 900));
 
       if (
@@ -301,18 +312,43 @@ export function useMatchScoreReporting(
         (options.expectedReport.player1Score !== report.player1Score ||
           options.expectedReport.player2Score !== report.player2Score)
       ) {
-        setConflictDetected(true);
-        setConflictingReport(options.expectedReport);
-        setIsReporting(false);
-        return false;
+        throw new ScoreConflictError(options.expectedReport);
       }
-
+      return report;
+    },
+    onMutate: (report) => {
+      const submittedReport: ScoreReport = {
+        reporterId: report.reporterId,
+        reporterName: report.reporterName ?? "You",
+        player1Score: report.player1Score,
+        player2Score: report.player2Score,
+        submittedAt: new Date().toISOString(),
+      };
+      queryClient.setQueryData(pendingKey, submittedReport);
+    },
+    onError: (error) => {
+      if (error instanceof ScoreConflictError) {
+        setConflictDetected(true);
+        setConflictingReport(error.expectedReport);
+      }
+    },
+    onSuccess: () => {
       setConflictDetected(false);
       setConflictingReport(null);
-      setIsReporting(false);
-      return true;
     },
-    [options.expectedReport],
+  });
+
+  const reportScore = useCallback(
+    async (report: ScoreSubmission): Promise<boolean> => {
+      try {
+        await mutation.mutateAsync(report);
+        return true;
+      } catch (error) {
+        if (error instanceof ScoreConflictError) return false;
+        throw error;
+      }
+    },
+    [mutation],
   );
 
   const clearConflict = useCallback(() => {
@@ -323,7 +359,7 @@ export function useMatchScoreReporting(
   return {
     reportScore,
     pendingReport,
-    isReporting,
+    isReporting: mutation.isPending,
     conflictDetected,
     conflictingReport,
     clearConflict,
