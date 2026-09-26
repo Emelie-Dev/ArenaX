@@ -24,11 +24,13 @@ use crate::middleware::cors_middleware;
 use crate::middleware::anti_bot::{AntiBotConfig, AntiBotMiddleware};
 use crate::middleware::csrf::{csrf_protection, csrf_token_handler};
 use crate::middleware::idempotency_middleware::IdempotencyMiddleware;
+use crate::middleware::ip_list::IpListMiddleware;
 use crate::middleware::metrics_middleware::RequestMetrics;
 use crate::middleware::rate_limit::RateLimitMiddleware;
 use crate::middleware::security::{SecurityConfig, SecurityMiddleware};
 use crate::middleware::security_headers::security_headers;
 use crate::middleware::tracing_middleware::RequestTracing;
+use crate::models::idempotency::IdempotencyPolicy;
 use crate::service::batch_service::BatchService;
 use crate::service::match_authority_service::MatchAuthorityService;
 use crate::service::ReaperService;
@@ -37,7 +39,6 @@ use crate::realtime::session_registry::SessionRegistry;
 use crate::realtime::ws_broadcaster::{WsAddressBook, WsBroadcaster};
 use crate::service::matchmaker::{MatchmakerService, MatchmakingConfig, EloEngine};
 use crate::service::soroban_service::{NetworkConfig, SorobanService};
-use crate::service::batch_service::BatchService;
 use crate::service::tournament_service::TournamentService;
 use crate::telemetry::init_telemetry;
 
@@ -45,6 +46,11 @@ use crate::telemetry::init_telemetry;
 async fn main() -> io::Result<()> {
     // Load configuration
     let config = Config::from_env().expect("Failed to load configuration");
+
+    // Reject a misspelled PAYMENT_PROVIDER at startup instead of letting
+    // WalletService fall back to a gateway nobody chose (#1069).
+    crate::service::payment_provider::PaymentProviderKind::from_env()
+        .expect("Invalid PAYMENT_PROVIDER");
 
     // Initialize telemetry — kept alive for the process lifetime so spans
     // are flushed to the OTLP exporter (Jaeger/Datadog) on shutdown.
@@ -172,6 +178,21 @@ async fn main() -> io::Result<()> {
     // Initialize BatchService — Issue #952
     let batch_service = Arc::new(BatchService::new(db_pool.clone()));
 
+    // Push notification service (FCM) — Issue #908. Both env vars are
+    // optional; when unset the service always falls back to in-app
+    // notifications rather than failing to start.
+    let fcm_config = match (&config.push.fcm_project_id, &config.push.fcm_service_account_json) {
+        (Some(project_id), Some(service_account_json)) => Some(crate::service::FcmConfig {
+            project_id: project_id.clone(),
+            service_account_json: service_account_json.clone(),
+        }),
+        _ => {
+            tracing::warn!("FCM not configured (FCM_PROJECT_ID / FCM_SERVICE_ACCOUNT_JSON unset); push notifications will fall back to in-app only");
+            None
+        }
+    };
+    let push_notification_service = Arc::new(crate::service::PushNotificationService::new(fcm_config));
+
     // Initialize real-time infrastructure
     let event_bus = EventBus::new(redis_conn.clone());
     let session_registry = Arc::new(SessionRegistry::new());
@@ -253,6 +274,7 @@ async fn main() -> io::Result<()> {
             .app_data(web::Data::new(batch_service.clone()))
             .app_data(web::Data::new(match_authority_service.clone()))
             .app_data(web::Data::new(protocol_signer_secret.clone()))
+            .app_data(web::Data::new(push_notification_service.clone()))
             .wrap(IdempotencyMiddleware::new(redis_conn.clone(), idempotency_policy.clone()))
             .wrap(RateLimitMiddleware::new(redis_conn.clone(), rate_limit_config.clone()))
             .wrap(SecurityMiddleware::new(redis_conn.clone(), SecurityConfig::default()))
@@ -261,6 +283,7 @@ async fn main() -> io::Result<()> {
             .wrap(actix_web::middleware::from_fn(csrf_protection))
             .wrap(cors_middleware())
             .wrap(actix_web::middleware::Logger::default())
+            .wrap(RequestMetrics::new())
             // RequestTracing sees the request first (extracts trace context /
             // correlation id) and the response last (records latency,
             // stamps correlation headers) among the "inner" layers below.
@@ -273,6 +296,10 @@ async fn main() -> io::Result<()> {
             // including ones short-circuited by an inner layer (CORS
             // preflight, CSRF rejection, rate limiting, etc).
             .wrap(actix_web::middleware::from_fn(security_headers))
+            // Unauthenticated Prometheus scrape target — kept outside the
+            // `/api` scope (and its rate-limit/idempotency/security
+            // middleware) so scraping never competes with real traffic.
+            .route("/metrics", web::get().to(crate::metrics::metrics_handler))
             .service(
                 web::scope("/api")
                     .route("/health", web::get().to(crate::http::health::health_check))
@@ -310,6 +337,13 @@ async fn main() -> io::Result<()> {
                     .route(
                         "/notifications/{id}",
                         web::delete().to(crate::http::notification_handler::delete_notification),
+                    )
+                    // Push notification service (FCM) — Issue #908
+                    .service(
+                        web::scope("/push")
+                            .route("/devices", web::post().to(crate::http::push_notification_handler::register_device))
+                            .route("/devices", web::delete().to(crate::http::push_notification_handler::unregister_device))
+                            .route("/send/{user_id}", web::post().to(crate::http::push_notification_handler::send_push_to_user)),
                     )
                     // Wallet endpoints
                     .service(
