@@ -397,6 +397,8 @@ async fn main() -> io::Result<()> {
                     .configure(crate::http::tournament_handler::configure_routes)
                     // Match authority endpoints — on-chain match FSM
                     .configure(crate::http::match_authority_handler::configure_routes)
+                    // Dispute resolution endpoints — ticketed, escalatable disputes (Issue #909)
+                    .configure(crate::http::dispute_handler::configure_routes)
                     // Gas endpoints
                     .service(
                         web::scope("/gas")
